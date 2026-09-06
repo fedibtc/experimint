@@ -547,12 +547,17 @@ async fn transfer_scan_surfaces_ground_candidates() -> anyhow::Result<()> {
     // Wait for consensus block count + the scanner to cover block 150, then
     // poll the client's own discovery round (unions every guardian's
     // `transfer_candidates` response and matches against the locally
-    // stored claim key) until it surfaces the ground deposit.
+    // stored claim key) until it surfaces the ground deposit AND the safe
+    // cursor has cleared the transfer's block. The cursor needs the
+    // SECOND-highest of the guardians' `scanned_to` marks (max_evil + 1
+    // vouchers), which can legitimately lag the single fastest guardian
+    // whose response already surfaced the match -- asserting the cursor on
+    // the first matching round would race that quorum.
     let deadline = Duration::from_secs(60);
     let summary = fedimint_core::runtime::timeout(deadline, async {
         loop {
             let summary = usdt.discover_deposits().await?;
-            if summary.matches.iter().any(|d| d.account == account) {
+            if summary.matches.iter().any(|d| d.account == account) && summary.cursor >= 150 {
                 return Ok::<_, anyhow::Error>(summary);
             }
             sleep(Duration::from_millis(200)).await;
