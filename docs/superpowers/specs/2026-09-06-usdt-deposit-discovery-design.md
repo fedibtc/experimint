@@ -67,10 +67,17 @@ entries) of an in-memory, size-capped buffer.
 
 - No `MODULE_CONSENSUS_VERSION` bump: no consensus item, no consensus
   config field, no server DB prefix, no wire input/output change.
-- New endpoint at `ApiVersion (0, 1)`; server advertises api `(0,1)`,
-  client requests `(0,1)`. Old clients (0,0) are untouched. New clients
-  tolerate not-yet-upgraded guardians because per-peer failures are simply
-  dropped from the union. Guardians can roll out one at a time.
+- New endpoint at `ApiVersion (0, 1)`; server advertises api `(0,1)`, but
+  the client deliberately keeps requesting `(0,0)` — bumping the client's
+  declared minor version would exclude any guardian still on `(0,0)` from
+  module api-version discovery and disable the whole client module
+  against a not-yet-upgraded federation. Instead the client calls
+  `transfer_candidates` via raw, un-gated per-peer requests
+  (`request_single_peer`), so a guardian lacking the endpoint just returns
+  a per-peer error that the union logic drops. Old clients (0,0) are
+  untouched. New clients tolerate not-yet-upgraded guardians because
+  per-peer failures are simply dropped from the union. Guardians can roll
+  out one at a time.
 - Old (un-ground) deposit addresses never match the predicate, so they
   never appear in the stream — but they remain claimable forever via the
   unchanged proof path, and `recover_deposits` checks both the legacy

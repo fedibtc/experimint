@@ -1203,7 +1203,7 @@ with
                             self.ground_claim_keypair_for_index(index).await?;
 ```
 
-- [ ] **Step 4: Bump the client api version.** `supported_api_versions` (lib.rs:1554-1557): `ApiVersion { major: 0, minor: 0 }` → `ApiVersion { major: 0, minor: 1 }`.
+- [ ] **Step 4: SUPERSEDED — client stays at api (0, 0).** Originally: bump `supported_api_versions` (lib.rs:1554-1557) from `ApiVersion { major: 0, minor: 0 }` to `ApiVersion { major: 0, minor: 1 }`. Code review found this would EXCLUDE not-yet-upgraded (0, 0) guardians from module api-version discovery and disable the whole client module against a federation where no guardian has upgraded (`discover_common_module_api_version` in `fedimint-client-module`). The `transfer_candidates` call is made via raw, un-gated per-peer requests instead, so the client keeps declaring (0, 0); see the reverted comment left in place at lib.rs:1554.
 
 - [ ] **Step 5: Run** — `cargo test -p fedimint-usdt-tests --test tests allocated_deposit`, plus `cargo test -p fedimint-usdt-tests --test tests deposit_becomes_claimable` (the full claim pipeline must be untouched by grinding — `ClaimKeyKey` carries the final keypair either way), plus the wasm check for `-client`.
 Expected: all PASS.

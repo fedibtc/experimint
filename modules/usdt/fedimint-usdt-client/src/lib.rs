@@ -1552,13 +1552,17 @@ impl ClientModuleInit for UsdtClientInit {
     type Module = UsdtClientModule;
 
     fn supported_api_versions(&self) -> MultiApiVersion {
-        // Bumped to (0, 1) alongside the server (deposit-discovery, Task
-        // 7): the `transfer_candidates` endpoint the client's
-        // deposit-discovery path (Task 9) depends on only exists at api
-        // (0, 1). Minor versions are additive on the server side, so this
-        // simply raises the minimum minor version this client code
-        // requires guardians to speak.
-        MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 1 }])
+        // DELIBERATELY (0, 0) even though the guardians' deposit-discovery
+        // endpoint is declared at api (0, 1): declaring minor 1 here would
+        // EXCLUDE not-yet-upgraded (0, 0) guardians from api-version
+        // discovery -- and disable this whole client module against a
+        // federation where no guardian has upgraded yet (see
+        // `fedimint-client-module`'s `discover_common_module_api_version`).
+        // The discovery flow instead calls `transfer_candidates` via raw
+        // per-peer requests, which are not version-gated; a guardian
+        // without the endpoint just returns a per-peer error that the
+        // union logic drops.
+        MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 0 }])
             .expect("no version conflicts")
     }
 
