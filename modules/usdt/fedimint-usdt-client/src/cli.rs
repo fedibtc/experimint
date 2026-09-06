@@ -127,6 +127,16 @@ enum Opts {
     /// recompute the `claim_pk` needed for a manual `deposit-status` or a
     /// `submit-deposit-proof`, e.g. for an index a `recover` scan reported
     /// under `checked`.
+    ///
+    /// Prints BOTH derivations for `index` (finding 1): `ground` -- the
+    /// DISCOVERABLE key (base key plus the deposit-discovery grind tweak)
+    /// that `allocate_deposit` actually funds/persists for every index
+    /// allocated since the deposit-discovery feature shipped -- and
+    /// `legacy` -- the plain, untweaked base key that pre-discovery
+    /// deposits were allocated under. A seed-only operator using only the
+    /// `legacy` output for a `deposit-status`/`submit-deposit-proof` against
+    /// a GROUND-funded deposit would conclude, wrongly, that their deposit
+    /// vanished; printing both removes that ambiguity.
     DeriveDeposit {
         #[arg(long)]
         index: u64,
@@ -273,14 +283,19 @@ pub(crate) async fn handle_cli_command(
             max_deposit_fee,
             accept_high_fee,
         } => {
-            let claim_keypair = usdt.claim_keypair_for_index(index);
-            let account = usdt.deposit_address(&claim_keypair.public_key());
             // The security finding 07 fee-cap guard runs inside
             // `submit_deposit_proof` (via `submit_prebuilt_deposit_proof`),
             // BEFORE any e-cash is minted -- it needs the freshly fetched
             // deposit-fee quote, which is only available once the submit
             // flow fetches it internally.
-            let operation_id = usdt
+            //
+            // Report from the returned `DepositClaimOutcome`, NOT a
+            // re-derived `claim_keypair_for_index(index)` (finding 2):
+            // `submit_deposit_proof` dual-probes the ground key first and
+            // only falls back to the legacy (untweaked) key, so re-deriving
+            // the legacy key here for display could report the wrong
+            // claim_pk/account for what was actually claimed.
+            let outcome = usdt
                 .submit_deposit_proof(
                     index,
                     evm_rpc_url,
@@ -290,9 +305,10 @@ pub(crate) async fn handle_cli_command(
                 .await?;
             json(serde_json::json!({
                 "index": index,
-                "claim_pk": claim_keypair.public_key(),
-                "account": account.to_string(),
-                "operation_id": operation_id.fmt_full().to_string(),
+                "claim_pk": outcome.claim_pk,
+                "account": outcome.account.to_string(),
+                "operation_id": outcome.operation_id.fmt_full().to_string(),
+                "used_legacy_key": outcome.used_legacy_key,
             }))
         }
         Opts::SetEvmRpcUrl { url } => {
@@ -334,12 +350,25 @@ pub(crate) async fn handle_cli_command(
             check_uncredited,
         } => json(usdt.recover_deposits(gap_limit, check_uncredited).await?),
         Opts::DeriveDeposit { index } => {
-            let claim_keypair = usdt.claim_keypair_for_index(index);
-            let account = usdt.deposit_address(&claim_keypair.public_key());
+            // Both derivations (finding 1): `allocate_deposit` funds the
+            // GROUND (discoverable) key, not the plain LEGACY base key, so a
+            // seed-only operator needs both to know which account their
+            // deposit actually landed in.
+            let (tweak, ground_keypair, ground_account) =
+                usdt.ground_claim_keypair_for_index(index).await?;
+            let legacy_keypair = usdt.claim_keypair_for_index(index);
+            let legacy_account = usdt.deposit_address(&legacy_keypair.public_key());
             json(serde_json::json!({
                 "index": index,
-                "claim_pk": claim_keypair.public_key(),
-                "account": account.to_string(),
+                "ground": {
+                    "tweak": tweak,
+                    "claim_pk": ground_keypair.public_key(),
+                    "account": ground_account.to_string(),
+                },
+                "legacy": {
+                    "claim_pk": legacy_keypair.public_key(),
+                    "account": legacy_account.to_string(),
+                },
             }))
         }
         Opts::DiscoverDeposits {

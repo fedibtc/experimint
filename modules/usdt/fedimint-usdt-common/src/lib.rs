@@ -1307,14 +1307,35 @@ pub struct TransferCandidatesRequest {
     pub since_block: u64,
 }
 
-/// Response for `TRANSFER_CANDIDATES_ENDPOINT`. `scanned_to` is the highest
-/// block THIS guardian's scan has fully covered; the client advances its
-/// cursor only to a height at least `max_evil + 1` responding guardians
-/// have covered (so one honest guardian vouches for it).
+/// Response page cap for the `transfer_candidates` endpoint: `CandidateLog::
+/// since` never returns more than this many candidates in one response.
+/// Lives here (rather than in `fedimint-usdt-server`, where it was
+/// originally defined) so the CLIENT can also see it -- it needs the exact
+/// cap to detect a full (possibly-truncated) page and page through catch-up
+/// requests (finding 3 / the honest-`scanned_to` contract below).
+/// `fedimint-usdt-server`'s `scan` module re-exports this (`pub use
+/// fedimint_usdt_common::MAX_TRANSFER_CANDIDATES_PER_RESPONSE`) so its own
+/// call sites keep working unchanged.
+pub const MAX_TRANSFER_CANDIDATES_PER_RESPONSE: usize = 512;
+
+/// Response for `TRANSFER_CANDIDATES_ENDPOINT`. `scanned_to` reports
+/// complete coverage through this height IN THIS RESPONSE ONLY -- not
+/// necessarily the guardian's overall scan progress
+/// (`CandidateLog::scanned_to`). The two coincide whenever `candidates` is
+/// NOT a full (`MAX_TRANSFER_CANDIDATES_PER_RESPONSE`-sized) page; when the
+/// page IS full, `scanned_to` is clamped down to one below the first omitted
+/// entry's block, so a caller can tell the response is a partial page and
+/// must re-query at this `scanned_to` to see the rest (finding 3: an honest
+/// per-response mark, so a truncated page can never be mistaken for full
+/// coverage). The client's `discover_deposits` (via `page_peer_candidates`)
+/// pages a peer forward on a full response until it gets a short one, and
+/// the OVERALL cursor rule (`safe_scan_cursor`, the `(max_evil + 1)`-th
+/// highest per-peer `scanned_to` across responding guardians) uses each
+/// peer's LAST response's `scanned_to` as that peer's contribution.
 #[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
 pub struct TransferCandidatesResponse {
-    /// Ascending block order, capped server-side; re-query with a higher
-    /// `since_block` to page.
+    /// Ascending block order, capped server-side; re-query at this
+    /// response's `scanned_to` to page.
     pub candidates: Vec<TransferCandidate>,
     pub scanned_to: u64,
 }

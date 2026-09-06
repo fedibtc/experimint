@@ -11,6 +11,12 @@ use std::collections::VecDeque;
 
 use fedimint_core::secp256k1;
 use fedimint_usdt_common::{TransferCandidate, UsdtAmount, is_potential_deposit};
+// Re-exported so existing `scan::MAX_TRANSFER_CANDIDATES_PER_RESPONSE` call
+// sites (server lib.rs, tests) keep working unchanged; the canonical
+// definition lives in `fedimint-usdt-common` (next to the wire types) so the
+// CLIENT can see it too -- it needs the exact cap to detect a full,
+// possibly-truncated page (finding 3).
+pub use fedimint_usdt_common::MAX_TRANSFER_CANDIDATES_PER_RESPONSE;
 
 use crate::rpc::TransferLog;
 
@@ -25,9 +31,6 @@ pub const CANDIDATE_RETENTION_BLOCKS: u64 = 50_400;
 /// this cap requires one REAL on-chain USDT transfer per entry, so the
 /// attack costs gas per entry and is visible on-chain.
 pub const MAX_CANDIDATE_ENTRIES: usize = 4_096;
-
-/// Response page cap for the `transfer_candidates` endpoint.
-pub const MAX_TRANSFER_CANDIDATES_PER_RESPONSE: usize = 512;
 
 /// This guardian's in-memory log of predicate-matching confirmed
 /// transfers, in ascending block order, plus the scan's high-water mark.
@@ -48,7 +51,22 @@ impl CandidateLog {
     /// Appends one scanned batch's findings and advances the high-water
     /// mark, then prunes by retention (relative to the new mark) and by
     /// the entry cap (oldest first).
+    ///
+    /// `up_to` must be non-decreasing across calls: `scan_step` (the sole
+    /// caller) only ever advances its scan cursor forward, so a batch's
+    /// coverage can never regress. This is the meaningful half of what used
+    /// to be a vacuous caller-side `debug_assert!(to >= from)` (that compared
+    /// the CALLER's own local `from`/`to`, which are constructed to satisfy
+    /// `to >= from` by construction and so could never fail) -- the
+    /// assertion worth making lives here, against `record_scan`'s own prior
+    /// state.
     pub fn record_scan(&mut self, up_to: u64, found: Vec<TransferCandidate>) {
+        debug_assert!(
+            up_to >= self.scanned_to,
+            "scan batches must arrive in non-decreasing coverage order: \
+             up_to={up_to} scanned_to={}",
+            self.scanned_to
+        );
         self.entries.extend(found);
         self.scanned_to = self.scanned_to.max(up_to);
         let floor = self.scanned_to.saturating_sub(CANDIDATE_RETENTION_BLOCKS);
@@ -61,17 +79,41 @@ impl CandidateLog {
     }
 
     /// Candidates strictly above `since_block`, oldest first, capped at
-    /// `limit`; plus the current high-water mark.
+    /// `limit`; plus an HONEST per-response high-water mark (finding 3).
+    ///
+    /// When the page is NOT truncated (fewer than `limit` matching entries
+    /// exist), the second element is the log's real `scanned_to` -- this
+    /// guardian has served every candidate it has ever found above
+    /// `since_block`. When the page IS truncated (`limit` reached with more
+    /// matching entries remaining), returning the full `scanned_to`
+    /// unconditionally would be a lie: a caller that advances its cursor to
+    /// it would skip every unserved candidate at or below the first omitted
+    /// entry's block forever, since nothing above `since_block` would ever
+    /// be re-queried. Instead, the returned mark is clamped to one below the
+    /// first OMITTED entry's block -- `min(scanned_to, first_omitted.
+    /// block_number - 1)` -- the highest height for which THIS response is
+    /// actually complete. Several entries sharing that first-omitted block
+    /// (a block with more matching transfers than fit in the remaining page)
+    /// are all still short of the clamp, so the mark never claims coverage
+    /// through a block this page only partially reports.
+    ///
+    /// Callers that need full coverage (not just one page) must page: keep
+    /// re-querying at the returned mark until a response comes back
+    /// untruncated (see `fedimint-usdt-client`'s `page_peer_candidates`).
     #[must_use]
     pub fn since(&self, since_block: u64, limit: usize) -> (Vec<TransferCandidate>, u64) {
-        let page = self
-            .entries
-            .iter()
-            .filter(|c| c.block_number > since_block)
-            .take(limit)
-            .cloned()
-            .collect();
-        (page, self.scanned_to)
+        let mut matching = self.entries.iter().filter(|c| c.block_number > since_block);
+        let page: Vec<TransferCandidate> = matching.by_ref().take(limit).cloned().collect();
+        let scanned_to = match matching.next() {
+            // Truncated: at least one matching entry beyond `limit` remains.
+            // Clamp below its block so this response never overclaims.
+            Some(first_omitted) => self
+                .scanned_to
+                .min(first_omitted.block_number.saturating_sub(1)),
+            // Untruncated: every matching entry made it into `page`.
+            None => self.scanned_to,
+        };
+        (page, scanned_to)
     }
 }
 
@@ -145,6 +187,63 @@ mod tests {
         log.record_scan(90 + CANDIDATE_RETENTION_BLOCKS + 1, vec![]);
         let (page, _) = log.since(0, 10);
         assert!(page.iter().all(|c| c.block_number > 90));
+    }
+
+    /// Finding 3: a page that hits `limit` before exhausting the matching
+    /// entries must clamp `scanned_to` below the first OMITTED entry's
+    /// block, not report the log's full high-water mark -- a caller that
+    /// advanced its cursor to the untruncated mark would never re-query the
+    /// blocks this page didn't have room for.
+    #[test]
+    fn since_clamps_scanned_to_when_the_page_is_truncated() {
+        let mut log = CandidateLog::default();
+        let entries: Vec<_> = (0..10).map(|i| cand(100 + i)).collect(); // blocks 100..=109
+        log.record_scan(500, entries);
+
+        // limit 5: page holds blocks 100..=104, first omitted is block 105.
+        let (page, scanned_to) = log.since(0, 5);
+        assert_eq!(
+            page.iter().map(|c| c.block_number).collect::<Vec<_>>(),
+            vec![100, 101, 102, 103, 104]
+        );
+        // Must NOT claim coverage through 105 (the first omitted entry's
+        // block) or the log's real mark (500) -- only through 104.
+        assert_eq!(scanned_to, 104);
+    }
+
+    /// Finding 3: several entries sharing the first-omitted block (more
+    /// matching transfers in one block than fit in the remaining page) must
+    /// never let `scanned_to` reach that block -- every one of them is
+    /// "omitted" from this page's point of view, so the response is
+    /// incomplete as of one block EARLIER, not as of the straddled block
+    /// itself.
+    #[test]
+    fn since_truncation_never_lets_scanned_to_reach_a_straddled_block() {
+        let mut log = CandidateLog::default();
+        // Three candidates land in block 100, one more in block 101.
+        log.record_scan(500, vec![cand(100), cand(100), cand(100), cand(101)]);
+
+        // limit 2 stops mid-block-100: the first omitted entry is ALSO at
+        // block 100, so scanned_to must clamp strictly below 100.
+        let (page, scanned_to) = log.since(0, 2);
+        assert_eq!(page.len(), 2);
+        assert!(
+            scanned_to < 100,
+            "scanned_to={scanned_to} must not reach the straddled block 100"
+        );
+    }
+
+    /// Finding 3: when a page is NOT truncated (every matching entry fits),
+    /// `since` must keep returning the log's real, full high-water mark --
+    /// the honest-clamping behavior above must not degrade the common case.
+    #[test]
+    fn since_untruncated_page_returns_the_full_scanned_to_mark() {
+        let mut log = CandidateLog::default();
+        log.record_scan(500, vec![cand(100), cand(101)]);
+
+        let (page, scanned_to) = log.since(0, 10);
+        assert_eq!(page.len(), 2);
+        assert_eq!(scanned_to, 500);
     }
 
     #[test]

@@ -228,6 +228,19 @@ local scan cursor to `safe_scan_cursor` — the `(max_evil + 1)`-th highest
 past a height at least one HONEST guardian has vouched for. A guardian
 withholding or lying about candidates can cause a client to see a deposit
 late, never speed one up or forge one (see "candidates are hints" above).
+Each per-response `scanned_to` is honest for THAT response only — a full
+(`MAX_TRANSFER_CANDIDATES_PER_RESPONSE`-sized) page clamps it below the
+first omitted entry's block rather than overclaiming the guardian's full
+scan progress — so the client pages a truncated peer forward
+(`page_peer_candidates`) before treating its mark as that peer's
+contribution to `safe_scan_cursor`. Accepted residual: an attacker who
+stuffs at least `MAX_TRANSFER_CANDIDATES_PER_RESPONSE` (512) REAL on-chain
+predicate-matching transfers into a single block can pin every honest
+guardian's per-page `scanned_to` below that block indefinitely (each
+guardian's page always truncates at the same height), stalling the cursor
+there until the retention cap (`CANDIDATE_RETENTION_BLOCKS`) eventually
+evicts those entries — the cost is 512 real on-chain transfers (visible,
+gas-costed) per block targeted, not a free griefing vector.
 
 **Interaction with the one-time-use limitation (accepted).** Because
 `DepositRecord.credited` is a high-water mark (see "Deposit addresses are

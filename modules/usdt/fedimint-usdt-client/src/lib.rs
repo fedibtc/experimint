@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(feature = "cli")]
 use std::ffi;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +46,8 @@ pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
     BootstrapState, DepositFeeQuoteResponse, DepositProof, DepositStatusResponse, EvmAddress, KIND,
-    MAX_SCAN_GRIND_ITERATIONS, PoolStateResponse, RefundStatusResponse, StatusResponse, USDT_UNIT,
+    MAX_SCAN_GRIND_ITERATIONS, MAX_TRANSFER_CANDIDATES_PER_RESPONSE, PoolStateResponse,
+    RefundStatusResponse, StatusResponse, TransferCandidate, TransferCandidatesResponse, USDT_UNIT,
     UsdtAmount, UsdtCommonInit, UsdtInput, UsdtModuleTypes, UsdtOutput, UsdtOutputV0,
     UserOpStatusResponse, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse,
     find_scan_tweak, scan_tweak_scalar, usdt_amount,
@@ -310,11 +312,87 @@ pub struct CheckedAccount {
 /// its candidates for) every block up to it. `None` when too few peers
 /// answered to clear that bar (keep the old cursor; candidates already
 /// unioned are still reported).
+///
+/// Each input `scanned_to` must itself be an HONEST per-peer mark for this
+/// guarantee to hold -- since finding 3, that means the LAST response of
+/// that peer's [`page_peer_candidates`] catch-up run, not just any single
+/// response's `scanned_to`: a guardian's `transfer_candidates` page can be
+/// truncated (more matching candidates above the query's `since_block` than
+/// [`MAX_TRANSFER_CANDIDATES_PER_RESPONSE`] fits), in which case that
+/// response's own `scanned_to` is clamped below the first omitted entry's
+/// block (see [`fedimint_usdt_common::TransferCandidatesResponse`]) rather
+/// than reporting the guardian's full scan progress. `page_peer_candidates`
+/// re-queries a truncated peer forward until it gets a short response, so
+/// its returned mark is the peer's true, fully-served coverage height --
+/// the one this function's "has covered (and served us its candidates for)"
+/// contract requires.
 #[must_use]
 pub fn safe_scan_cursor(scanned_tos: &[u64], num_peers: NumPeers) -> Option<u64> {
     let mut sorted = scanned_tos.to_vec();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
     sorted.get(num_peers.max_evil()).copied()
+}
+
+/// Hard bound on catch-up round-trips [`page_peer_candidates`] makes for a
+/// single peer in one [`UsdtClientModule::discover_deposits`] round -- so a
+/// peer sitting on an unbounded backlog of full pages cannot stall discovery
+/// forever. At [`MAX_TRANSFER_CANDIDATES_PER_RESPONSE`] candidates per page,
+/// this still covers a very large single-round backlog before giving up
+/// (the next `discover_deposits` round picks up where this one's returned
+/// `scanned_to` left off).
+const MAX_CATCHUP_PAGES: u32 = 32;
+
+/// Pages one peer's `transfer_candidates` forward from `since` until a
+/// response comes back short of a full page, or the response reports no
+/// further progress, or [`MAX_CATCHUP_PAGES`] round-trips are spent
+/// (finding 3): `CandidateLog::since` (server-side) caps each response at
+/// [`MAX_TRANSFER_CANDIDATES_PER_RESPONSE`] candidates and, when truncated,
+/// clamps `scanned_to` to the highest height that response fully covers --
+/// so re-querying at that mark is always safe and makes forward progress
+/// whenever there IS more to serve.
+///
+/// `fetch(since_block)` performs one `transfer_candidates` round-trip (a
+/// real caller passes a closure wrapping
+/// `self.module_api.transfer_candidates(peer, since_block)`; tests script it
+/// directly with no API fake needed).
+///
+/// Returns `None` if the FIRST request fails -- the peer is skipped for this
+/// round entirely, exactly as before paging existed. A failure partway
+/// through paging is NOT fatal: it returns `Some` with whatever candidates
+/// were accumulated so far and the last SUCCESSFUL response's `scanned_to`
+/// as this peer's contribution (a candidate stream is a hint, never
+/// authority -- see SECURITY.md -- so partial progress this round is still
+/// useful and is never discarded).
+async fn page_peer_candidates<F, Fut>(since: u64, fetch: F) -> Option<(Vec<TransferCandidate>, u64)>
+where
+    F: Fn(u64) -> Fut,
+    Fut: Future<Output = anyhow::Result<TransferCandidatesResponse>>,
+{
+    let mut peer_since = since;
+    let mut candidates = Vec::new();
+    let mut scanned_to = since;
+
+    for iteration in 0..MAX_CATCHUP_PAGES {
+        let resp = match fetch(peer_since).await {
+            Ok(resp) => resp,
+            // First request failed: skip this peer entirely, as before.
+            Err(_) if iteration == 0 => return None,
+            // Mid-paging failure: keep the progress already accumulated.
+            Err(_) => break,
+        };
+        let full_page = resp.candidates.len() == MAX_TRANSFER_CANDIDATES_PER_RESPONSE;
+        let made_progress = resp.scanned_to > peer_since;
+        scanned_to = resp.scanned_to;
+        candidates.extend(resp.candidates);
+        if !full_page || !made_progress {
+            // Short page: fully caught up. A full page with no progress
+            // would otherwise spin forever re-querying the same height.
+            break;
+        }
+        peer_since = scanned_to;
+    }
+
+    Some((candidates, scanned_to))
 }
 
 /// One discovered candidate matching a claim key this client holds.
@@ -335,6 +413,26 @@ pub struct DiscoverySummary {
     /// The (possibly advanced) persisted cursor after this round.
     pub cursor: u64,
     pub peers_answering: usize,
+}
+
+/// Outcome of a successful [`UsdtClientModule::submit_deposit_proof`] (or
+/// [`UsdtClientModule::submit_deposit_proof_for_account`]) claim: which
+/// keypair/account actually won the ground-then-legacy dual probe, alongside
+/// the submitted transaction's [`OperationId`] (finding 2) -- so a caller
+/// need not re-derive (and potentially guess wrong) which key was claimed
+/// against.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DepositClaimOutcome {
+    pub operation_id: OperationId,
+    /// The claim public key the winning probe actually used.
+    pub claim_pk: secp256k1::PublicKey,
+    /// The deposit account derived from `claim_pk`.
+    pub account: EvmAddress,
+    /// `true` if the LEGACY (untweaked) key won the probe -- i.e. the
+    /// primary, GROUND-key probe failed with "nothing new to credit" and the
+    /// legacy fallback succeeded instead (see
+    /// [`UsdtClientModule::submit_deposit_proof`]'s dual-probe doc).
+    pub used_legacy_key: bool,
 }
 
 /// Data needed by the state machine
@@ -1004,14 +1102,17 @@ impl UsdtClientModule {
 
     /// One battery-cheap discovery round (mobile: call on app-foreground
     /// instead of polling any EVM RPC): queries every guardian's
-    /// `transfer_candidates` stream above the persisted cursor, unions the
-    /// responses, matches them against this client's stored claim keys,
-    /// and advances the cursor by the [`safe_scan_cursor`] rule. Read-only
-    /// apart from the cursor: claiming is the caller's (or
+    /// `transfer_candidates` stream above the persisted cursor -- PAGING
+    /// each peer forward via [`page_peer_candidates`] past any single
+    /// truncated response (finding 3) -- unions the results, matches them
+    /// against this client's stored claim keys, and advances the cursor by
+    /// the [`safe_scan_cursor`] rule (using each peer's LAST page's
+    /// `scanned_to` as that peer's contribution, per `safe_scan_cursor`'s
+    /// doc). Read-only apart from the cursor: claiming is the caller's (or
     /// [`Self::discover_and_claim_deposits`]'s) separate step. Guardians
-    /// that fail (or predate api 0.1, during a rolling upgrade) are
-    /// skipped; candidates above the safe cursor are simply re-served next
-    /// round (matching is idempotent).
+    /// that fail their FIRST request (or predate api 0.1, during a rolling
+    /// upgrade) are skipped; candidates above the safe cursor are simply
+    /// re-served next round (matching is idempotent).
     pub async fn discover_deposits(&self) -> anyhow::Result<DiscoverySummary> {
         let since = {
             let mut dbtx = self.db.begin_transaction_nc().await;
@@ -1021,15 +1122,29 @@ impl UsdtClientModule {
         let num_peers = NumPeers::from(peers.len());
         let mut responses = Vec::new();
         for peer in peers {
-            match self.module_api.transfer_candidates(peer, since).await {
-                Ok(resp) => responses.push(resp),
-                Err(err) => {
-                    debug!(target: "usdt", %peer, err = %err, "transfer_candidates peer skipped");
+            let module_api = self.module_api.clone();
+            let page = page_peer_candidates(since, move |since_block| {
+                let module_api = module_api.clone();
+                async move {
+                    module_api
+                        .transfer_candidates(peer, since_block)
+                        .await
+                        .map_err(anyhow::Error::from)
+                }
+            })
+            .await;
+            match page {
+                Some(page) => responses.push(page),
+                None => {
+                    debug!(target: "usdt", %peer, "transfer_candidates peer skipped");
                 }
             }
         }
 
-        let scanned: Vec<u64> = responses.iter().map(|r| r.scanned_to).collect();
+        let scanned: Vec<u64> = responses
+            .iter()
+            .map(|(_, scanned_to)| *scanned_to)
+            .collect();
         let cursor = safe_scan_cursor(&scanned, num_peers)
             .unwrap_or(since)
             .max(since);
@@ -1037,7 +1152,7 @@ impl UsdtClientModule {
         let mut seen = HashSet::new();
         let mut matches = Vec::new();
         let mut dbtx = self.db.begin_transaction_nc().await;
-        for c in responses.iter().flat_map(|r| &r.candidates) {
+        for c in responses.iter().flat_map(|(candidates, _)| candidates) {
             if !seen.insert((c.block_number, c.to, c.value)) {
                 continue;
             }
@@ -1068,7 +1183,11 @@ impl UsdtClientModule {
     /// Credits (and, atomically in the same transaction, mints) the deposit at
     /// seed-derivation `index` by fetching an on-chain balance proof and
     /// submitting it as a [`UsdtInput::DepositProofV0`] (deposit-by-proof,
-    /// Task 9). Returns the submitted transaction's [`OperationId`].
+    /// Task 9). Returns a [`DepositClaimOutcome`] reporting the submitted
+    /// transaction's [`OperationId`] plus which keypair/account (ground or
+    /// legacy) actually won the dual probe below (finding 2) -- a caller
+    /// must not re-derive `claim_keypair_for_index(index)` for display, since
+    /// that is only ever the LEGACY key and may not be the one just claimed.
     ///
     /// DUAL-PROBE by key (mirrors [`Self::recover_deposits_scan`]'s
     /// ground-then-legacy semantics, Task 10 / Task 11): since deposit
@@ -1141,8 +1260,8 @@ impl UsdtClientModule {
         evm_rpc_url: Option<String>,
         max_deposit_fee: Option<UsdtAmount>,
         accept_high_fee: bool,
-    ) -> anyhow::Result<OperationId> {
-        let (ground_tweak, ground_keypair, _ground_account) =
+    ) -> anyhow::Result<DepositClaimOutcome> {
+        let (ground_tweak, ground_keypair, ground_account) =
             self.ground_claim_keypair_for_index(index).await?;
 
         let ground_err = match self
@@ -1154,7 +1273,14 @@ impl UsdtClientModule {
             )
             .await
         {
-            Ok(op) => return Ok(op),
+            Ok(operation_id) => {
+                return Ok(DepositClaimOutcome {
+                    operation_id,
+                    claim_pk: ground_keypair.public_key(),
+                    account: ground_account,
+                    used_legacy_key: false,
+                });
+            }
             Err(err) => err,
         };
 
@@ -1167,6 +1293,7 @@ impl UsdtClientModule {
         }
 
         let legacy_keypair = self.claim_keypair_for_index(index);
+        let legacy_account = self.deposit_address(&legacy_keypair.public_key());
         match self
             .submit_deposit_proof_with_keypair(
                 legacy_keypair,
@@ -1176,7 +1303,12 @@ impl UsdtClientModule {
             )
             .await
         {
-            Ok(op) => Ok(op),
+            Ok(operation_id) => Ok(DepositClaimOutcome {
+                operation_id,
+                claim_pk: legacy_keypair.public_key(),
+                account: legacy_account,
+                used_legacy_key: true,
+            }),
             Err(legacy_err) => Err(ground_err.context(format!(
                 "ground (discoverable) claim key had nothing new to credit; legacy (untweaked) \
                  claim key fallback also failed: {legacy_err}"
@@ -1997,11 +2129,13 @@ mod tests {
     use super::{
         Amount, Amounts, Database, DepositFeeQuoteResponse, DepositProof, DepositStatusResponse,
         EvmAddress, FEE_QUOTE_UNAVAILABLE_MESSAGE, IDatabaseTransactionOpsCoreTyped, Keypair,
-        NothingNewToCreditError, OutPoint, PeerId, PoolStateResponse, RefundStatusResponse,
-        SECP256K1, StatusResponse, USDT_UNIT, UsdtAmount, UsdtClientConfig, UsdtClientModule,
-        UsdtFederationApi, UsdtInput, UserOpStatusResponse, WithdrawFeeQuoteResponse,
-        WithdrawalStatusResponse, check_fee_cap, ensure_fee_quote_available,
-        is_nothing_new_to_credit_error, safe_scan_cursor, secp256k1,
+        MAX_CATCHUP_PAGES, MAX_TRANSFER_CANDIDATES_PER_RESPONSE, NothingNewToCreditError, OutPoint,
+        PeerId, PoolStateResponse, RefundStatusResponse, SECP256K1, StatusResponse,
+        TransferCandidate, TransferCandidatesResponse, USDT_UNIT, UsdtAmount, UsdtClientConfig,
+        UsdtClientModule, UsdtFederationApi, UsdtInput, UserOpStatusResponse,
+        WithdrawFeeQuoteResponse, WithdrawalStatusResponse, check_fee_cap,
+        ensure_fee_quote_available, is_nothing_new_to_credit_error, page_peer_candidates,
+        safe_scan_cursor, secp256k1,
     };
     use crate::db::{ClaimKeyKey, NextDepositIndexKey};
 
@@ -2017,6 +2151,148 @@ mod tests {
         // Fewer than max_evil+1 responses -> no safe cursor.
         assert_eq!(safe_scan_cursor(&[1000], n4), None);
         assert_eq!(safe_scan_cursor(&[], n4), None);
+    }
+
+    /// A `TransferCandidate` whose exact contents don't matter for
+    /// [`page_peer_candidates`] tests -- only how many are returned per
+    /// page and what `scanned_to` each response reports.
+    fn sample_candidate() -> TransferCandidate {
+        TransferCandidate {
+            block_number: 1,
+            to: EvmAddress([0u8; 20]),
+            value: UsdtAmount(1),
+        }
+    }
+
+    /// Finding 3 (client side): a full first page followed by a short
+    /// (non-full) second page must accumulate candidates from BOTH pages
+    /// and report the LAST response's `scanned_to`, not stop after the
+    /// first (truncated) page as the pre-fix client did.
+    #[tokio::test]
+    async fn page_peer_candidates_accumulates_full_page_then_short_page() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let (candidates, scanned_to) = page_peer_candidates(0, |since_block| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    assert_eq!(since_block, 0, "first page must query the original `since`");
+                    Ok(TransferCandidatesResponse {
+                        candidates: vec![sample_candidate(); MAX_TRANSFER_CANDIDATES_PER_RESPONSE],
+                        scanned_to: 100,
+                    })
+                } else {
+                    assert_eq!(
+                        since_block, 100,
+                        "second page must re-query at the first page's scanned_to"
+                    );
+                    Ok(TransferCandidatesResponse {
+                        candidates: vec![sample_candidate()],
+                        scanned_to: 150,
+                    })
+                }
+            }
+        })
+        .await
+        .expect("first request succeeds");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(candidates.len(), MAX_TRANSFER_CANDIDATES_PER_RESPONSE + 1);
+        assert_eq!(
+            scanned_to, 150,
+            "must report the LAST response's scanned_to"
+        );
+    }
+
+    /// Finding 3 (client side): a full page that reports NO progress
+    /// (`scanned_to` unchanged from the query's `since_block`) must
+    /// terminate immediately rather than re-querying the exact same height
+    /// forever.
+    #[tokio::test]
+    async fn page_peer_candidates_terminates_on_full_page_with_no_progress() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let (candidates, scanned_to) = page_peer_candidates(50, |since_block| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                assert_eq!(since_block, 50);
+                Ok(TransferCandidatesResponse {
+                    candidates: vec![sample_candidate(); MAX_TRANSFER_CANDIDATES_PER_RESPONSE],
+                    scanned_to: 50, // full page, but no progress
+                })
+            }
+        })
+        .await
+        .expect("first request succeeds");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a no-progress full page must not be re-queried"
+        );
+        assert_eq!(candidates.len(), MAX_TRANSFER_CANDIDATES_PER_RESPONSE);
+        assert_eq!(scanned_to, 50);
+    }
+
+    /// Finding 3 (client side): a failure partway through paging must keep
+    /// (not discard) whatever was accumulated from earlier, successful
+    /// pages, reporting the last SUCCESSFUL response's `scanned_to`.
+    #[tokio::test]
+    async fn page_peer_candidates_keeps_progress_on_mid_loop_failure() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let (candidates, scanned_to) = page_peer_candidates(0, |_since_block| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    Ok(TransferCandidatesResponse {
+                        candidates: vec![sample_candidate(); MAX_TRANSFER_CANDIDATES_PER_RESPONSE],
+                        scanned_to: 100,
+                    })
+                } else {
+                    Err(anyhow::anyhow!("peer went away mid-page"))
+                }
+            }
+        })
+        .await
+        .expect("the FIRST request succeeded, so this must still be Some");
+
+        assert_eq!(candidates.len(), MAX_TRANSFER_CANDIDATES_PER_RESPONSE);
+        assert_eq!(scanned_to, 100);
+    }
+
+    /// A first-request failure must skip the peer entirely (`None`),
+    /// exactly as `discover_deposits` treated a failing
+    /// `transfer_candidates` call before paging existed.
+    #[tokio::test]
+    async fn page_peer_candidates_returns_none_on_first_request_failure() {
+        let result = page_peer_candidates(0, |_since_block| async {
+            Err(anyhow::anyhow!("unreachable"))
+        })
+        .await;
+        assert!(result.is_none());
+    }
+
+    /// A peer sitting on an unbounded backlog of always-full, always-
+    /// progressing pages must not stall discovery forever -- paging stops
+    /// at [`MAX_CATCHUP_PAGES`] round-trips regardless.
+    #[tokio::test]
+    async fn page_peer_candidates_respects_the_iteration_bound() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let (_candidates, scanned_to) = page_peer_candidates(0, |since_block| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Ok(TransferCandidatesResponse {
+                    candidates: vec![sample_candidate(); MAX_TRANSFER_CANDIDATES_PER_RESPONSE],
+                    scanned_to: since_block + 1,
+                })
+            }
+        })
+        .await
+        .expect("first request succeeds");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CATCHUP_PAGES
+        );
+        assert_eq!(scanned_to, u64::from(MAX_CATCHUP_PAGES));
     }
 
     /// Deterministic test keypair (mirrors

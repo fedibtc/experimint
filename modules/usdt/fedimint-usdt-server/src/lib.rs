@@ -3890,10 +3890,6 @@ impl Usdt {
         let to = from
             .saturating_add(scan_batch_blocks.saturating_sub(1))
             .min(target);
-        debug_assert!(
-            to >= from,
-            "scan batch range must be non-empty: from={from} to={to}"
-        );
         match rpc_deadline(evm_rpc.get_transfer_logs(usdt_contract, from, to)).await {
             Ok(logs) => {
                 let found = scan::filter_scan_candidates(&logs, group_public_key);
@@ -3904,11 +3900,15 @@ impl Usdt {
                     "scan batch results must be sorted by block_number: {found:?}"
                 );
                 // `CandidateLog::record_scan` assumes entries arrive in
-                // ascending block order and batches arrive in
-                // non-decreasing ranges (Task 5 review). Both hold here by
-                // construction: `from`/`to` only ever advance (the cursor
-                // is monotonic), and `eth_getLogs`/`filter_scan_candidates`
-                // preserve the underlying logs' block order.
+                // ascending block order (asserted above) and batches arrive
+                // in non-decreasing ranges (asserted INSIDE `record_scan`
+                // itself, against its own prior `scanned_to` -- a
+                // caller-side `to >= from` check here would be vacuous,
+                // since `from`/`to` are constructed to satisfy that by
+                // construction). Both hold here: `from`/`to` only ever
+                // advance (the cursor is monotonic), and
+                // `eth_getLogs`/`filter_scan_candidates` preserve the
+                // underlying logs' block order.
                 transfer_candidates
                     .lock()
                     .expect("not poisoned")
@@ -9044,7 +9044,11 @@ mod tests {
 
         // Response-page cap: a `limit` of 1 (as if
         // `MAX_TRANSFER_CANDIDATES_PER_RESPONSE` were 1) returns only the
-        // OLDEST entry above the cursor, not the newest.
+        // OLDEST entry above the cursor, not the newest -- and (finding 3)
+        // a TRUNCATED page must clamp `scanned_to` below the first omitted
+        // entry's block (11), not report the log's real high-water mark
+        // (20): a caller that advanced its cursor to 20 would never
+        // re-query for the two candidates this page didn't have room for.
         let (capped, capped_scanned_to) = module
             .transfer_candidates
             .lock()
@@ -9052,7 +9056,7 @@ mod tests {
             .since(0, 1);
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].block_number, 10);
-        assert_eq!(capped_scanned_to, 20);
+        assert_eq!(capped_scanned_to, 10);
     }
 
     #[tokio::test]

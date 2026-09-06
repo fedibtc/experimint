@@ -81,4 +81,11 @@ pub const LATEST_ANCHORED_BLOCK_ENDPOINT: &str = "latest_anchored_block";
 /// and union the responses (see
 /// `fedimint-usdt-client`'s `discover_deposits`). Added at `ApiVersion`
 /// (0, 1) — the deposit-discovery feature.
+///
+/// Each response's `scanned_to` (see [`crate::TransferCandidatesResponse`])
+/// reflects complete coverage through that height IN THIS RESPONSE ONLY: a
+/// full (`MAX_TRANSFER_CANDIDATES_PER_RESPONSE`-sized) page clamps it below
+/// the first omitted entry's block, so callers must page (re-query at the
+/// returned `scanned_to`) rather than trust the guardian's overall scan
+/// progress from one response.
 pub const TRANSFER_CANDIDATES_ENDPOINT: &str = "transfer_candidates";
