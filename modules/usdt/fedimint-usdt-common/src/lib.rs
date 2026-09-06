@@ -505,6 +505,20 @@ pub fn chainlink_eth_usd_to_usdt_per_eth_e6(
 /// [`derive_deposit_account`]).
 pub const DEPOSIT_ADDRESS_DOMAIN: &[u8] = b"fedimint-usdt-deposit-v0";
 
+/// Domain-separation tag for the deposit-discovery scan predicate (see
+/// [`is_potential_deposit`]). Mixed with the federation's `group_public_key`
+/// so one grind cannot be amortized across federations.
+pub const SCAN_PREDICATE_DOMAIN: &[u8] = b"fedimint-usdt-scan-v0";
+
+/// Leading zero bits [`is_potential_deposit`]'s hash must have for a deposit
+/// account to be discoverable by the guardians' Transfer-log scan. 16 bits
+/// (walletv2's `is_potential_receive` difficulty): a ~sub-second client-side
+/// grind, and a false-positive rate of `transfers × 2^-16` in the candidate
+/// stream. A CONSTANT (not config): every guardian and client must agree on
+/// it, and changing it would strand previously ground addresses out of the
+/// stream (they would still be claimable via proof, but undiscoverable).
+pub const DEPOSIT_SCAN_TAG_BITS: u32 = 16;
+
 /// Domain-separation tag whose `keccak256` IS the pool account's CREATE2
 /// `salt` directly (see [`derive_pool_account`]) -- unlike
 /// [`DEPOSIT_ADDRESS_DOMAIN`], which is only ever mixed with a `claim_pk`
@@ -815,26 +829,78 @@ fn create2_simple_account(
     owner: EvmAddress,
     salt: [u8; 32],
 ) -> EvmAddress {
-    use alloy_sol_types::{SolCall as _, SolValue as _};
+    create2_address(
+        account_factory,
+        salt,
+        deposit_init_code_hash(simple_account_impl, owner),
+    )
+}
 
+/// Whether `account` is discoverable by the guardians' deposit scan:
+/// `keccak256(SCAN_PREDICATE_DOMAIN ‖ group_pk_compressed ‖ account)` has
+/// [`DEPOSIT_SCAN_TAG_BITS`] leading zero bits. Pure, WASM-safe; guardians
+/// evaluate it over every USDT `Transfer` log's `to` address, clients grind
+/// claim-key tweaks until it holds (see [`find_scan_tweak`]). NOTE the
+/// accepted privacy trade-off (SECURITY.md "Deposit discovery"): anyone
+/// holding the public `group_public_key` can tag matching addresses as
+/// probable deposits of this federation.
+#[must_use]
+pub fn is_potential_deposit(
+    group_public_key: &secp256k1::PublicKey,
+    account: &EvmAddress,
+) -> bool {
+    let mut hasher = Keccak256::new();
+    hasher.update(SCAN_PREDICATE_DOMAIN);
+    hasher.update(group_public_key.serialize());
+    hasher.update(account.0);
+    has_leading_zero_bits(&hasher.finalize(), DEPOSIT_SCAN_TAG_BITS)
+}
+
+/// `bits` leading zero bits check, byte-wise then a partial-byte mask.
+fn has_leading_zero_bits(bytes: &[u8], bits: u32) -> bool {
+    let full = (bits / 8) as usize;
+    let rem = bits % 8;
+    if bytes.len() < full + usize::from(rem > 0) {
+        return false;
+    }
+    if bytes[..full].iter().any(|b| *b != 0) {
+        return false;
+    }
+    rem == 0 || (bytes[full] >> (8 - rem)) == 0
+}
+
+/// `keccak256` of the deposit account's CREATE2 `initCode` — constant across
+/// all claim keys of one federation (it depends only on the implementation
+/// address and the group-key owner), extracted so the grinding hot loop pays
+/// three short keccaks per candidate instead of hashing the ~10.7KB
+/// `ERC1967_PROXY_CREATION_CODE` every iteration.
+#[must_use]
+pub fn deposit_init_code_hash(simple_account_impl: EvmAddress, owner: EvmAddress) -> [u8; 32] {
+    use alloy_sol_types::{SolCall as _, SolValue as _};
     let initialize_calldata = ISimpleAccountInit::initializeCall {
         anOwner: alloy_primitives::Address::from(owner.0),
     }
     .abi_encode();
-    // `abi.encode(address, bytes)`, matching `ERC1967Proxy`'s
-    // `constructor(address implementation, bytes memory _data)`.
     let ctor_args = (
         alloy_primitives::Address::from(simple_account_impl.0),
         alloy_primitives::Bytes::from(initialize_calldata),
     )
         .abi_encode_params();
-
     let mut init_code = ERC1967_PROXY_CREATION_CODE.to_vec();
     init_code.extend_from_slice(&ctor_args);
+    alloy_primitives::keccak256(&init_code).into()
+}
 
-    let factory_address = alloy_primitives::Address::from(account_factory.0);
-    let derived = factory_address.create2_from_code(salt, init_code);
-
+/// EIP-1014 address from a precomputed init-code hash (the fast half of
+/// [`create2_simple_account`]).
+#[must_use]
+pub fn create2_address(
+    account_factory: EvmAddress,
+    salt: [u8; 32],
+    init_code_hash: [u8; 32],
+) -> EvmAddress {
+    let derived = alloy_primitives::Address::from(account_factory.0)
+        .create2(salt, alloy_primitives::B256::from(init_code_hash));
     EvmAddress(derived.into_array())
 }
 
@@ -2177,6 +2243,69 @@ mod tests {
             derive_deposit_account(&group, factory, simple_account_impl, &claim_a),
             derive_deposit_account(&group, factory, other_impl, &claim_a)
         );
+    }
+
+    /// A fixed, valid secp256k1 public key standing in for a federation's
+    /// `group_public_key` in scan-predicate/CREATE2 tests.
+    fn test_group_pk() -> secp256k1::PublicKey {
+        secp256k1::SecretKey::from_slice(&[0x11; 32])
+            .expect("valid scalar")
+            .public_key(secp256k1::SECP256K1)
+    }
+
+    #[test]
+    fn scan_predicate_is_deterministic_and_rare() {
+        let group_pk = test_group_pk();
+        let a = EvmAddress([0x11; 20]);
+        assert_eq!(
+            is_potential_deposit(&group_pk, &a),
+            is_potential_deposit(&group_pk, &a)
+        );
+        // 16-bit predicate: out of 1000 arbitrary addresses, expect ~0 hits.
+        let hits = (0u8..=255)
+            .flat_map(|x| (0u8..4).map(move |y| EvmAddress([x ^ y; 20])))
+            .filter(|addr| is_potential_deposit(&group_pk, addr))
+            .count();
+        assert!(hits <= 2, "predicate should hit ~1 in 2^16, got {hits}/1024");
+    }
+
+    #[test]
+    fn leading_zero_bits_boundaries() {
+        assert!(has_leading_zero_bits(&[0x00, 0x00, 0xff], 16));
+        assert!(!has_leading_zero_bits(&[0x00, 0x01, 0x00], 16));
+        assert!(has_leading_zero_bits(&[0x00, 0x7f], 9));
+        assert!(!has_leading_zero_bits(&[0x00, 0x80], 9));
+    }
+
+    #[test]
+    fn create2_fast_path_matches_slow_path() {
+        // The refactor must not change any derived address: compare the
+        // (init-code-hash) fast path against a from-scratch
+        // `create2_from_code` computation for a couple of inputs.
+        let owner = EvmAddress([0x22; 20]);
+        let factory = EvmAddress([0x33; 20]);
+        let impl_ = EvmAddress([0x44; 20]);
+        let salt = [0x55u8; 32];
+        let expected = {
+            // inline duplicate of the pre-refactor body, kept only in this test
+            use alloy_sol_types::{SolCall as _, SolValue as _};
+            let initialize_calldata = ISimpleAccountInit::initializeCall {
+                anOwner: alloy_primitives::Address::from(owner.0),
+            }
+            .abi_encode();
+            let ctor_args = (
+                alloy_primitives::Address::from(impl_.0),
+                alloy_primitives::Bytes::from(initialize_calldata),
+            )
+                .abi_encode_params();
+            let mut init_code = ERC1967_PROXY_CREATION_CODE.to_vec();
+            init_code.extend_from_slice(&ctor_args);
+            let derived =
+                alloy_primitives::Address::from(factory.0).create2_from_code(salt, init_code);
+            EvmAddress(derived.into_array())
+        };
+        let fast = create2_address(factory, salt, deposit_init_code_hash(impl_, owner));
+        assert_eq!(fast, expected);
     }
 
     #[test]
