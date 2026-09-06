@@ -7,15 +7,16 @@ use fedimint_core::{OutPoint, PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
     DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
     LATEST_ANCHORED_BLOCK_ENDPOINT, POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT,
-    USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
-    WITHDRAW_FEES_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    TRANSFER_CANDIDATES_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
+    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAW_FEES_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
     AnchoredBlockResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositStatusRequest,
     DepositStatusResponse, EvmAddress, PoolStateResponse, RefundStatusRequest,
-    RefundStatusResponse, StatusResponse, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse,
-    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawFeesRequest,
-    WithdrawalStatusRequest, WithdrawalStatusResponse,
+    RefundStatusResponse, StatusResponse, TransferCandidatesRequest, TransferCandidatesResponse,
+    UsdtAmount, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
+    WithdrawFeeQuoteResponse, WithdrawFeesRequest, WithdrawalStatusRequest,
+    WithdrawalStatusResponse,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -108,6 +109,22 @@ pub trait UsdtFederationApi {
         amount: UsdtAmount,
         auth: ApiAuth,
     ) -> FederationResult<()>;
+
+    /// Streams `peer`'s guardian-LOCAL view of plausible incoming deposits
+    /// above `since_block` (deposit discovery). Unlike every other read in
+    /// this trait, answers legitimately DIFFER across peers (each guardian
+    /// scans independently) — callers union responses from several peers
+    /// and advance their cursor with `safe_scan_cursor`. Called via
+    /// `request_single_peer`, which is not version-gated, so it works
+    /// against upgraded guardians even while this client's
+    /// `supported_api_versions` stays pinned at `(0, 0)` (see
+    /// `UsdtClientInit::supported_api_versions`), and returns a clean
+    /// per-peer error from not-yet-upgraded guardians that callers tolerate.
+    async fn transfer_candidates(
+        &self,
+        peer: PeerId,
+        since_block: u64,
+    ) -> FederationResult<TransferCandidatesResponse>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -224,5 +241,21 @@ where
             auth,
         )
         .await
+    }
+
+    async fn transfer_candidates(
+        &self,
+        peer: PeerId,
+        since_block: u64,
+    ) -> FederationResult<TransferCandidatesResponse> {
+        self.request_single_peer(
+            TRANSFER_CANDIDATES_ENDPOINT.to_string(),
+            ApiRequestErased::new(TransferCandidatesRequest { since_block }),
+            peer,
+        )
+        .await
+        .map_err(|e| {
+            FederationError::new_one_peer(peer, TRANSFER_CANDIDATES_ENDPOINT, since_block, e)
+        })
     }
 }

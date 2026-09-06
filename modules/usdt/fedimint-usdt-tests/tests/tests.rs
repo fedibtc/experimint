@@ -6,11 +6,9 @@ use std::time::Duration;
 
 use anyhow::bail;
 use common::MockEvmRpc;
-use fedimint_api_client::api::FederationApiExt as _;
 use fedimint_client::ClientHandleArc;
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{IDatabaseTransactionOpsCore, IDatabaseTransactionOpsCoreTyped};
-use fedimint_core::module::ApiRequestErased;
 use fedimint_core::runtime::{Instant, sleep};
 use fedimint_core::{Amount, BitcoinHash as _, PeerId, secp256k1};
 use fedimint_mint_client::{MintClientInit, MintClientModule};
@@ -23,11 +21,10 @@ use fedimint_testing::federation::FederationTest;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_usdt_client::api::UsdtFederationApi;
 use fedimint_usdt_client::{UsdtClientInit, UsdtClientModule};
-use fedimint_usdt_common::endpoint_constants::TRANSFER_CANDIDATES_ENDPOINT;
 use fedimint_usdt_common::user_op::UserOpReceipt;
 use fedimint_usdt_common::{
-    EvmAddress, FeeVote, TransferCandidatesRequest, TransferCandidatesResponse, USDT_UNIT,
-    UsdtAmount, UserOpStatus, deposit_fee_quote, is_potential_deposit, withdrawal_fee_quote,
+    EvmAddress, FeeVote, USDT_UNIT, UsdtAmount, UserOpStatus, deposit_fee_quote,
+    is_potential_deposit, withdrawal_fee_quote,
 };
 use fedimint_usdt_server::UsdtInit;
 use fedimint_usdt_server::db::{
@@ -352,28 +349,15 @@ async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The guardian scanner surfaces a predicate-matching confirmed transfer
-/// through the `transfer_candidates` endpoint, and non-matching transfers
-/// never appear.
-///
-/// PARKED (Task 7): the brief's intended version of this test asks
-/// `usdt.allocate_deposit()` for the "ground" (predicate-matching) address --
-/// proving a REAL client-derivable claim key is discoverable, not just any
-/// predicate-matching address. `allocate_deposit` only gains that grinding in
-/// Task 8, so for now this test grinds a synthetic matching address by brute
-/// force instead (mirroring `fedimint_usdt_server::scan`'s own
-/// `filter_scan_candidates_applies_predicate_and_value_gate` unit test),
-/// which exercises the transport path (scanner -> in-memory log ->
-/// guardian-local endpoint) but not yet the end-to-end
-/// discovery-then-claim property. It also calls the endpoint through the
-/// raw module api (`request_single_peer`) rather than a wrapped client
-/// method, since the client only gains a `transfer_candidates` method in
-/// Task 9. `#[ignore]`d until Task 9 lands that client-side method plus
-/// cursor/union logic and the grinding this test's final form depends on;
-/// per the brief, restore the `allocate_deposit`-derived ground address and
-/// un-ignore there.
+/// The guardian scanner surfaces a predicate-matching confirmed transfer for
+/// a REAL client-derivable deposit address, and the client's
+/// [`UsdtClientModule::discover_deposits`] (Task 9) unions the guardian's
+/// `transfer_candidates` response and matches it against the locally stored
+/// claim key -- while a non-matching transfer never appears. Exercises the
+/// full path: scanner -> in-memory log -> guardian-local endpoint ->
+/// client-side `transfer_candidates` call -> union/cursor logic -> claim-key
+/// match.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "enabled in Task 9"]
 async fn transfer_scan_surfaces_ground_candidates() -> anyhow::Result<()> {
     let mock = Arc::new(MockEvmRpc::new());
     let usdt_contract = EvmAddress([0u8; 20]);
@@ -403,62 +387,69 @@ async fn transfer_scan_surfaces_ground_candidates() -> anyhow::Result<()> {
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
 
-    // A ground (predicate-matching) address, ground by brute force since
-    // `allocate_deposit` does not yet grind for one (Task 8).
-    let account = (0u64..)
-        .map(|i| {
-            let mut a = [0u8; 20];
-            a[..8].copy_from_slice(&i.to_be_bytes());
-            EvmAddress(a)
-        })
-        .find(|a| is_potential_deposit(&group_public_key, a))
-        .expect("some synthetic address matches");
+    // A REAL client-derivable ground (predicate-matching) deposit address:
+    // `allocate_deposit` grinds for discoverability (Task 8) and persists
+    // the claim key under the derived account, which is exactly what
+    // `discover_deposits` (Task 9) matches unioned candidates against.
+    let (_claim_keypair, account) = usdt.allocate_deposit().await?;
+    assert!(is_potential_deposit(&group_public_key, &account));
     // A non-matching address.
     let stray = EvmAddress([0xEE; 20]);
     assert!(!is_potential_deposit(&group_public_key, &stray));
 
+    // The guardian-local scanner has been running (and catching up to the
+    // `mock.set_block_number(64)` head set above) since the federation
+    // booted, well before this point -- so by now it has almost certainly
+    // already scanned past low block heights with an empty transfer log.
+    // Advance the chain head and place the transfers at a FRESH block
+    // safely above anything already scanned (mirroring how a deposit would
+    // arrive in a real chain: after, not before, a guardian observed the
+    // chain), so the scanner's next tick is guaranteed to cover it.
+    mock.set_block_number(200);
     mock.set_transfer_logs(
         usdt_contract,
         vec![
             TransferLog {
-                block_number: 10,
+                block_number: 150,
                 to: account,
                 value: 5_000_000,
             },
             TransferLog {
-                block_number: 10,
+                block_number: 150,
                 to: stray,
                 value: 5_000_000,
             },
         ],
     );
 
-    // Wait for consensus block count + the scanner to cover block 10, then
-    // ask one guardian directly. Raw module-api call (not a wrapped client
-    // method: that lands in Task 9).
+    // Wait for consensus block count + the scanner to cover block 150, then
+    // poll the client's own discovery round (unions every guardian's
+    // `transfer_candidates` response and matches against the locally
+    // stored claim key) until it surfaces the ground deposit.
     let deadline = Duration::from_secs(60);
-    let found = fedimint_core::runtime::timeout(deadline, async {
+    let summary = fedimint_core::runtime::timeout(deadline, async {
         loop {
-            let resp = client
-                .api()
-                .with_module(usdt.id)
-                .request_single_peer::<TransferCandidatesResponse>(
-                    TRANSFER_CANDIDATES_ENDPOINT.to_string(),
-                    ApiRequestErased::new(TransferCandidatesRequest { since_block: 0 }),
-                    PeerId::from(0),
-                )
-                .await;
-            if let Ok(resp) = resp
-                && resp.candidates.iter().any(|c| c.to == account)
-            {
-                assert!(resp.candidates.iter().all(|c| c.to != stray));
-                return resp;
+            let summary = usdt.discover_deposits().await?;
+            if summary.matches.iter().any(|d| d.account == account) {
+                return Ok::<_, anyhow::Error>(summary);
             }
             sleep(Duration::from_millis(200)).await;
         }
     })
-    .await?;
-    assert!(found.scanned_to >= 10);
+    .await??;
+
+    let matched = summary
+        .matches
+        .iter()
+        .find(|d| d.account == account)
+        .expect("account was just confirmed present above");
+    assert_eq!(matched.block_number, 150);
+    assert_eq!(matched.value, UsdtAmount(5_000_000));
+    assert!(
+        summary.matches.iter().all(|d| d.account != stray),
+        "the non-matching transfer must never surface as a match"
+    );
+    assert!(summary.cursor >= 150);
     Ok(())
 }
 

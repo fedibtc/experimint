@@ -131,6 +131,19 @@ enum Opts {
         #[arg(long)]
         index: u64,
     },
+    /// Queries the guardians' deposit-discovery stream for transfers to
+    /// this client's addresses; with `--claim`, immediately runs the
+    /// deposit-proof claim flow for each match.
+    DiscoverDeposits {
+        #[arg(long, default_value_t = false)]
+        claim: bool,
+        #[arg(long)]
+        evm_rpc_url: Option<String>,
+        #[arg(long)]
+        max_deposit_fee: Option<u64>,
+        #[arg(long, default_value_t = false)]
+        accept_high_fee: bool,
+    },
 }
 
 /// Handles `Opts::Withdraw`, factored out of [`handle_cli_command`] purely to
@@ -185,6 +198,58 @@ async fn handle_withdrawal_status(
             "reason": info.reason,
         })),
     })))
+}
+
+/// Handles `Opts::DiscoverDeposits`, factored out of [`handle_cli_command`]
+/// for the same reason as [`handle_withdraw`].
+async fn handle_discover_deposits(
+    usdt: &UsdtClientModule,
+    claim: bool,
+    evm_rpc_url: Option<String>,
+    max_deposit_fee: Option<u64>,
+    accept_high_fee: bool,
+) -> anyhow::Result<Value> {
+    let max_deposit_fee = max_deposit_fee.map(UsdtAmount);
+    if claim {
+        let results = usdt
+            .discover_and_claim_deposits(evm_rpc_url, max_deposit_fee, accept_high_fee)
+            .await?;
+        Ok(json(serde_json::json!({
+            "claims": results
+                .into_iter()
+                .map(|(deposit, result)| {
+                    serde_json::json!({
+                        "account": deposit.account.to_string(),
+                        "claim_pk": deposit.claim_pk,
+                        "block_number": deposit.block_number,
+                        "value": deposit.value.0,
+                        "result": match result {
+                            Ok(operation_id) => serde_json::json!({
+                                "operation_id": operation_id.fmt_full().to_string(),
+                            }),
+                            Err(err) => serde_json::json!({ "error": err }),
+                        },
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })))
+    } else {
+        let summary = usdt.discover_deposits().await?;
+        Ok(json(serde_json::json!({
+            "matches": summary
+                .matches
+                .iter()
+                .map(|d| serde_json::json!({
+                    "account": d.account.to_string(),
+                    "claim_pk": d.claim_pk,
+                    "block_number": d.block_number,
+                    "value": d.value.0,
+                }))
+                .collect::<Vec<_>>(),
+            "cursor": summary.cursor,
+            "peers_answering": summary.peers_answering,
+        })))
+    }
 }
 
 pub(crate) async fn handle_cli_command(
@@ -276,6 +341,15 @@ pub(crate) async fn handle_cli_command(
                 "claim_pk": claim_keypair.public_key(),
                 "account": account.to_string(),
             }))
+        }
+        Opts::DiscoverDeposits {
+            claim,
+            evm_rpc_url,
+            max_deposit_fee,
+            accept_high_fee,
+        } => {
+            handle_discover_deposits(usdt, claim, evm_rpc_url, max_deposit_fee, accept_high_fee)
+                .await?
         }
     };
 
@@ -540,6 +614,43 @@ mod tests {
         assert!(matches!(
             Opts::try_parse_from(["usdt", "derive-deposit", "--index", "7"]).expect("parses"),
             Opts::DeriveDeposit { index: 7 }
+        ));
+    }
+
+    #[test]
+    fn parses_discover_deposits() {
+        // Bare invocation: no `--claim`, discovery only.
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "discover-deposits"]).expect("parses"),
+            Opts::DiscoverDeposits {
+                claim: false,
+                evm_rpc_url: None,
+                max_deposit_fee: None,
+                accept_high_fee: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_discover_deposits_with_claim_flags() {
+        assert!(matches!(
+            Opts::try_parse_from([
+                "usdt",
+                "discover-deposits",
+                "--claim",
+                "--evm-rpc-url",
+                "https://example.invalid/rpc",
+                "--max-deposit-fee",
+                "1000",
+                "--accept-high-fee",
+            ])
+            .expect("parses"),
+            Opts::DiscoverDeposits {
+                claim: true,
+                evm_rpc_url: Some(_),
+                max_deposit_fee: Some(1000),
+                accept_high_fee: true,
+            }
         ));
     }
 

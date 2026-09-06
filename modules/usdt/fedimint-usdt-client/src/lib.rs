@@ -3,7 +3,7 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(feature = "cli")]
 use std::ffi;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use api::UsdtFederationApi;
 use db::{
     ClaimKeyKey, ClaimKeyPrefixAll, DbKeyPrefix, EvmRpcUrlKey, EvmRpcUrlPrefixAll,
     NextDepositIndexKey, NextDepositIndexPrefixAll, NextRefundIndexKey, NextRefundIndexPrefixAll,
-    RefundKeyKey, RefundKeyPrefixAll,
+    RefundKeyKey, RefundKeyPrefixAll, ScanCursorKey, ScanCursorPrefixAll,
 };
 use fedimint_api_client::api::DynModuleApi;
 use fedimint_client_module::db::ClientModuleMigrationFn;
@@ -37,7 +37,8 @@ use fedimint_core::module::{
 use fedimint_core::runtime::{Instant, sleep};
 use fedimint_core::secp256k1::{self, Keypair, SECP256K1};
 use fedimint_core::{
-    Amount, OutPoint, OutPointRange, PeerId, apply, async_trait_maybe_send, push_db_pair_items,
+    Amount, NumPeers, OutPoint, OutPointRange, PeerId, apply, async_trait_maybe_send,
+    push_db_pair_items,
 };
 use fedimint_derive_secret::{ChildId, DerivableSecret};
 pub use fedimint_usdt_common as common;
@@ -53,6 +54,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use states::{UsdtStateMachine, WithdrawalRefundCommon, WithdrawalRefundState};
 use strum::IntoEnumIterator;
+use tracing::debug;
 
 pub mod api;
 #[cfg(feature = "cli")]
@@ -269,6 +271,39 @@ pub struct CheckedAccount {
     pub account: EvmAddress,
     /// The public key of the (re-derived, re-persisted) claim keypair.
     pub claim_pk: secp256k1::PublicKey,
+}
+
+/// The cursor a client may safely advance to after a discovery round:
+/// the `(max_evil + 1)`-th highest `scanned_to` among responding
+/// guardians, so at least one HONEST guardian has covered (and served us
+/// its candidates for) every block up to it. `None` when too few peers
+/// answered to clear that bar (keep the old cursor; candidates already
+/// unioned are still reported).
+#[must_use]
+pub fn safe_scan_cursor(scanned_tos: &[u64], num_peers: NumPeers) -> Option<u64> {
+    let mut sorted = scanned_tos.to_vec();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    sorted.get(num_peers.max_evil()).copied()
+}
+
+/// One discovered candidate matching a claim key this client holds.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredDeposit {
+    pub account: EvmAddress,
+    pub claim_pk: secp256k1::PublicKey,
+    pub block_number: u64,
+    pub value: UsdtAmount,
+}
+
+/// Result of one [`UsdtClientModule::discover_deposits`] round.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoverySummary {
+    /// Candidates whose `to` matched a stored `ClaimKeyKey` -- run the
+    /// claim flow for these (`submit_deposit_proof_for_account`).
+    pub matches: Vec<DiscoveredDeposit>,
+    /// The (possibly advanced) persisted cursor after this round.
+    pub cursor: u64,
+    pub peers_answering: usize,
 }
 
 /// Data needed by the state machine
@@ -876,6 +911,69 @@ impl UsdtClientModule {
         Ok(self.module_api.latest_anchored_block().await?)
     }
 
+    /// One battery-cheap discovery round (mobile: call on app-foreground
+    /// instead of polling any EVM RPC): queries every guardian's
+    /// `transfer_candidates` stream above the persisted cursor, unions the
+    /// responses, matches them against this client's stored claim keys,
+    /// and advances the cursor by the [`safe_scan_cursor`] rule. Read-only
+    /// apart from the cursor: claiming is the caller's (or
+    /// [`Self::discover_and_claim_deposits`]'s) separate step. Guardians
+    /// that fail (or predate api 0.1, during a rolling upgrade) are
+    /// skipped; candidates above the safe cursor are simply re-served next
+    /// round (matching is idempotent).
+    pub async fn discover_deposits(&self) -> anyhow::Result<DiscoverySummary> {
+        let since = {
+            let mut dbtx = self.db.begin_transaction_nc().await;
+            dbtx.get_value(&ScanCursorKey).await.unwrap_or(0)
+        };
+        let peers = self.all_peers();
+        let num_peers = NumPeers::from(peers.len());
+        let mut responses = Vec::new();
+        for peer in peers {
+            match self.module_api.transfer_candidates(peer, since).await {
+                Ok(resp) => responses.push(resp),
+                Err(err) => {
+                    debug!(target: "usdt", %peer, err = %err, "transfer_candidates peer skipped");
+                }
+            }
+        }
+
+        let scanned: Vec<u64> = responses.iter().map(|r| r.scanned_to).collect();
+        let cursor = safe_scan_cursor(&scanned, num_peers)
+            .unwrap_or(since)
+            .max(since);
+
+        let mut seen = HashSet::new();
+        let mut matches = Vec::new();
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        for c in responses.iter().flat_map(|r| &r.candidates) {
+            if !seen.insert((c.block_number, c.to, c.value)) {
+                continue;
+            }
+            if let Some(keypair) = dbtx.get_value(&ClaimKeyKey(c.to)).await {
+                matches.push(DiscoveredDeposit {
+                    account: c.to,
+                    claim_pk: keypair.public_key(),
+                    block_number: c.block_number,
+                    value: c.value,
+                });
+            }
+        }
+        drop(dbtx);
+
+        if cursor > since {
+            let mut dbtx = self.db.begin_transaction().await;
+            dbtx.insert_entry(&ScanCursorKey, &cursor).await;
+            dbtx.commit_tx().await;
+        }
+
+        Ok(DiscoverySummary {
+            matches,
+            cursor,
+            peers_answering: responses.len(),
+        })
+    }
+
     /// Credits (and, atomically in the same transaction, mints) the deposit at
     /// seed-derivation `index` by fetching an on-chain balance proof and
     /// submitting it as a [`UsdtInput::DepositProofV0`] (deposit-by-proof,
@@ -924,6 +1022,29 @@ impl UsdtClientModule {
         accept_high_fee: bool,
     ) -> anyhow::Result<OperationId> {
         let claim_keypair = self.claim_keypair_for_index(index);
+        self.submit_deposit_proof_with_keypair(
+            claim_keypair,
+            evm_rpc_url,
+            max_deposit_fee,
+            accept_high_fee,
+        )
+        .await
+    }
+
+    /// The transport half of [`Self::submit_deposit_proof`], addressed by
+    /// KEYPAIR instead of seed index -- shared by [`Self::submit_deposit_proof`]
+    /// (which derives the keypair from `index` first) and
+    /// [`Self::submit_deposit_proof_for_account`] (which looks it up by
+    /// `account` instead). Fetches the proof over this client's own
+    /// WASM-safe HTTP and delegates to [`Self::submit_prebuilt_deposit_proof`]
+    /// for the fee-cap guard and submission.
+    async fn submit_deposit_proof_with_keypair(
+        &self,
+        claim_keypair: Keypair,
+        evm_rpc_url: Option<String>,
+        max_deposit_fee: Option<UsdtAmount>,
+        accept_high_fee: bool,
+    ) -> anyhow::Result<OperationId> {
         let account = self.deposit_address(&claim_keypair.public_key());
 
         let anchored = self.module_api.latest_anchored_block().await?;
@@ -946,6 +1067,59 @@ impl UsdtClientModule {
             accept_high_fee,
         )
         .await
+    }
+
+    /// [`Self::submit_deposit_proof`] addressed by ACCOUNT (the form a
+    /// discovery match yields) instead of seed index: looks up the stored
+    /// claim key for `account` and runs the identical proof-fetch + submit
+    /// flow. Errors if this client holds no claim key for `account`.
+    pub async fn submit_deposit_proof_for_account(
+        &self,
+        account: EvmAddress,
+        evm_rpc_url: Option<String>,
+        max_deposit_fee: Option<UsdtAmount>,
+        accept_high_fee: bool,
+    ) -> anyhow::Result<OperationId> {
+        let claim_keypair = {
+            let mut dbtx = self.db.begin_transaction_nc().await;
+            dbtx.get_value(&ClaimKeyKey(account))
+                .await
+                .with_context(|| format!("no claim key stored for {account}"))?
+        };
+        self.submit_deposit_proof_with_keypair(
+            claim_keypair,
+            evm_rpc_url,
+            max_deposit_fee,
+            accept_high_fee,
+        )
+        .await
+    }
+
+    /// Convenience: one discovery round, then a claim attempt per match.
+    /// Per-match failures (e.g. already claimed -> stale delta, or fee cap
+    /// exceeded) are reported, not fatal -- a re-served candidate whose
+    /// deposit was already credited is expected noise.
+    pub async fn discover_and_claim_deposits(
+        &self,
+        evm_rpc_url: Option<String>,
+        max_deposit_fee: Option<UsdtAmount>,
+        accept_high_fee: bool,
+    ) -> anyhow::Result<Vec<(DiscoveredDeposit, Result<OperationId, String>)>> {
+        let summary = self.discover_deposits().await?;
+        let mut out = Vec::new();
+        for d in summary.matches {
+            let res = self
+                .submit_deposit_proof_for_account(
+                    d.account,
+                    evm_rpc_url.clone(),
+                    max_deposit_fee,
+                    accept_high_fee,
+                )
+                .await
+                .map_err(|e| e.to_string());
+            out.push((d, res));
+        }
+        Ok(out)
     }
 
     /// Submits an already-built [`DepositProof`] of `claim_keypair`'s derived
@@ -1604,6 +1778,16 @@ impl ModuleInit for UsdtClientInit {
                         "Usdt Evm Rpc Url"
                     );
                 }
+                DbKeyPrefix::ScanCursor => {
+                    push_db_pair_items!(
+                        dbtx,
+                        ScanCursorPrefixAll,
+                        ScanCursorKey,
+                        u64,
+                        items,
+                        "Usdt Scan Cursor"
+                    );
+                }
             }
         }
 
@@ -1651,6 +1835,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use fedimint_api_client::api::FederationResult;
+    use fedimint_core::NumPeers;
     use fedimint_core::db::mem_impl::MemDatabase;
     use fedimint_core::module::registry::ModuleDecoderRegistry;
     use fedimint_derive_secret::DerivableSecret;
@@ -1661,9 +1846,23 @@ mod tests {
         OutPoint, PeerId, PoolStateResponse, RefundStatusResponse, SECP256K1, StatusResponse,
         USDT_UNIT, UsdtAmount, UsdtClientModule, UsdtFederationApi, UsdtInput,
         UserOpStatusResponse, WithdrawFeeQuoteResponse, WithdrawalStatusResponse, check_fee_cap,
-        ensure_fee_quote_available, secp256k1,
+        ensure_fee_quote_available, safe_scan_cursor, secp256k1,
     };
     use crate::db::{ClaimKeyKey, NextDepositIndexKey};
+
+    /// The cursor rule (Task 9): a lying/fast guardian claiming a much
+    /// higher `scanned_to` than everyone else must not be able to drag the
+    /// client's cursor forward on its own -- only the `(max_evil + 1)`-th
+    /// highest value counts, so at least one HONEST guardian vouches for it.
+    #[test]
+    fn safe_scan_cursor_takes_max_evil_plus_one_th_highest() {
+        let n4 = NumPeers::from(4); // threshold 3, max_evil 1
+        // One lying/fast guardian claiming 1000 must not drag the cursor up:
+        assert_eq!(safe_scan_cursor(&[1000, 90, 80, 70], n4), Some(90));
+        // Fewer than max_evil+1 responses -> no safe cursor.
+        assert_eq!(safe_scan_cursor(&[1000], n4), None);
+        assert_eq!(safe_scan_cursor(&[], n4), None);
+    }
 
     /// Deterministic test keypair (mirrors
     /// [`UsdtClientModule::claim_keypair_static`]'s derivation, but with an
@@ -2076,6 +2275,14 @@ mod tests {
             _auth: fedimint_core::module::ApiAuth,
         ) -> FederationResult<()> {
             unimplemented!("recover_deposits_scan never calls withdraw_fees")
+        }
+
+        async fn transfer_candidates(
+            &self,
+            _peer: PeerId,
+            _since_block: u64,
+        ) -> FederationResult<fedimint_usdt_common::TransferCandidatesResponse> {
+            unimplemented!("recover_deposits_scan never calls transfer_candidates")
         }
     }
 

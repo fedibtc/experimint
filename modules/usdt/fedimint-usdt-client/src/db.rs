@@ -30,6 +30,10 @@ pub enum DbKeyPrefix {
     /// built-in [`crate::evm::DEFAULT_EVM_RPC_URLS`] default when a per-call
     /// `evm_rpc_url` argument is not supplied.
     EvmRpcUrl = 0x05,
+    /// Singleton cursor: the highest block height the deposit-discovery
+    /// scan (`crate::UsdtClientModule::discover_deposits`) has safely
+    /// consumed candidates up to (see `crate::safe_scan_cursor`).
+    ScanCursor = 0x06,
 }
 
 /// Maps a derived deposit account (see
@@ -136,3 +140,21 @@ impl_db_record!(
 );
 
 impl_db_lookup!(key = EvmRpcUrlKey, query_prefix = EvmRpcUrlPrefixAll);
+
+/// Singleton key holding the highest block height
+/// [`crate::UsdtClientModule::discover_deposits`] has safely advanced its
+/// scan cursor to, per the [`crate::safe_scan_cursor`] rule. Absent (treated
+/// as `0`) before the first discovery round.
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct ScanCursorKey;
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct ScanCursorPrefixAll;
+
+impl_db_record!(
+    key = ScanCursorKey,
+    value = u64,
+    db_prefix = DbKeyPrefix::ScanCursor,
+);
+
+impl_db_lookup!(key = ScanCursorKey, query_prefix = ScanCursorPrefixAll);
