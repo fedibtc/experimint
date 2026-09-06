@@ -1145,6 +1145,7 @@ impl ServerModuleInit for UsdtInit {
                         local: UsdtConfigLocal {
                             evm_rpc_url: crate::config::default_evm_rpc_url(),
                             broadcaster_private_key: None,
+                            scan_batch_blocks: crate::config::default_scan_batch_blocks(),
                         },
                     },
                     consensus: UsdtConfigConsensus {
@@ -1694,6 +1695,17 @@ pub struct Usdt {
     /// pattern.
     #[allow(clippy::type_complexity)]
     residual_recovery_proposals: Arc<Mutex<Vec<(fedimint_usdt_common::EvmAddress, u64)>>>,
+    /// This guardian's in-memory deposit-discovery candidate log
+    /// (`scan::CandidateLog`), fed by the READ-ONLY
+    /// [`Usdt::spawn_transfer_scanner`] task and served by the
+    /// guardian-local `transfer_candidates` endpoint. NEVER consensus
+    /// state: answers legitimately differ across guardians, and nothing in
+    /// any `process_*` path reads it (sec-13 COMMIT-SAFETY).
+    ///
+    /// `#[allow(dead_code)]`: not yet read outside of construction -- the
+    /// `transfer_candidates` API endpoint that serves it is a later task.
+    #[allow(dead_code)]
+    transfer_candidates: Arc<Mutex<scan::CandidateLog>>,
 }
 
 /// One guardian-local observation of a submitted `UserOp`'s on-chain outcome
@@ -1780,6 +1792,28 @@ struct BlockHashObserverHandles {
     /// height reference all honest guardians target) from the local DB.
     num_peers: NumPeers,
     block_hash_proposals: Arc<Mutex<Option<BlockHashObservation>>>,
+}
+
+/// Grouped handles/config for [`Usdt::spawn_transfer_scanner`] (guardian-local
+/// deposit discovery). All uses are read-only: the scanner reads
+/// `consensus_block_count` from the guardian-local DB, reads confirmed
+/// Transfer logs via `evm_rpc.get_transfer_logs`, and appends matches to the
+/// in-memory `transfer_candidates` log -- it NEVER writes the consensus DB
+/// (commit-safety constraint).
+struct TransferScannerHandles {
+    db: Database,
+    evm_rpc: DynServerEvmRpc,
+    /// Needed to compute `consensus_block_count(dbtx, num_peers)` (the shared
+    /// height reference every guardian's scan converges on) from the local
+    /// DB.
+    num_peers: NumPeers,
+    confirmation_depth: u64,
+    usdt_contract: fedimint_usdt_common::EvmAddress,
+    group_public_key: secp256k1::PublicKey,
+    /// Blocks per `eth_getLogs` request (`UsdtConfigLocal::scan_batch_blocks`,
+    /// guardian-local tuning).
+    scan_batch_blocks: u64,
+    transfer_candidates: Arc<Mutex<scan::CandidateLog>>,
 }
 
 /// Grouped handles/config for [`Usdt::spawn_anchor_watchdog`] (deposit-anchor
@@ -3023,6 +3057,7 @@ impl Usdt {
     /// poller task (see [`Usdt::spawn_block_count_poller`]) and the other
     /// guardian-local observer/submitter tasks (see e.g.
     /// [`Usdt::spawn_user_op_submitter`]).
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         cfg: UsdtConfig,
         evm_rpc: DynServerEvmRpc,
@@ -3101,6 +3136,21 @@ impl Usdt {
             },
         );
 
+        let transfer_candidates = Arc::new(Mutex::new(scan::CandidateLog::default()));
+        Self::spawn_transfer_scanner(
+            &task_group,
+            TransferScannerHandles {
+                db: db.clone(),
+                evm_rpc: evm_rpc.clone(),
+                num_peers,
+                confirmation_depth: cfg.consensus.confirmation_depth,
+                usdt_contract: cfg.consensus.usdt_contract,
+                group_public_key: cfg.consensus.group_public_key,
+                scan_batch_blocks: cfg.private.local.scan_batch_blocks.max(1),
+                transfer_candidates: transfer_candidates.clone(),
+            },
+        );
+
         // Guardian-local balances-slot consistency check (config footgun
         // guard; see `spawn_balances_slot_checker`). Sampled accounts, in
         // probe order: the token contract itself FIRST (canonical mainnet
@@ -3140,6 +3190,7 @@ impl Usdt {
             bootstrap_proposals,
             block_hash_proposals,
             residual_recovery_proposals,
+            transfer_candidates,
         }
     }
 
@@ -3182,6 +3233,10 @@ impl Usdt {
             // the other pollers); tests drive recovery by feeding
             // `RecoverResidual` items through `process_consensus_item` directly.
             residual_recovery_proposals: Arc::new(Mutex::new(Vec::new())),
+            // The transfer scanner is NOT spawned in tests (mirroring the
+            // other pollers); tests that need candidates call
+            // `Usdt::scan_step` directly.
+            transfer_candidates: Arc::new(Mutex::new(scan::CandidateLog::default())),
         }
     }
 
@@ -3732,6 +3787,128 @@ impl Usdt {
                 fedimint_core::runtime::sleep(Duration::from_secs(poll_interval_secs())).await;
             }
         });
+    }
+
+    /// Spawns the guardian-local deposit-discovery scanner: walks confirmed
+    /// block ranges (`consensus_block_count - confirmation_depth`, the same
+    /// height discipline as `spawn_block_hash_observer` so every guardian
+    /// converges on the same coverage) with ranged Transfer-log reads,
+    /// filters by `is_potential_deposit`, and appends to the in-memory
+    /// `CandidateLog`. READ-ONLY against the DB (`begin_transaction_nc`;
+    /// sec-13) and restart-safe by design: state is rebuilt by re-scanning
+    /// the retention window (`CANDIDATE_RETENTION_BLOCKS /
+    /// scan_batch_blocks` bounded requests).
+    fn spawn_transfer_scanner(task_group: &TaskGroup, handles: TransferScannerHandles) {
+        let TransferScannerHandles {
+            db,
+            evm_rpc,
+            num_peers,
+            confirmation_depth,
+            usdt_contract,
+            group_public_key,
+            scan_batch_blocks,
+            transfer_candidates,
+        } = handles;
+
+        task_group.spawn_cancellable("usdt-transfer-scanner", async move {
+            loop {
+                let mut dbtx = db.begin_transaction_nc().await;
+                let ccount = consensus_block_count(&mut dbtx.to_ref_nc(), num_peers).await;
+                drop(dbtx);
+                let target = ccount.saturating_sub(confirmation_depth);
+
+                let caught_up = if target == 0 {
+                    true // consensus hasn't observed the chain yet; wait
+                } else {
+                    !Self::scan_step(
+                        &evm_rpc,
+                        &transfer_candidates,
+                        target,
+                        usdt_contract,
+                        &group_public_key,
+                        scan_batch_blocks,
+                    )
+                    .await
+                };
+
+                // While behind (cold-start backfill / catch-up), pause only
+                // briefly between batches; otherwise idle a full poll tick.
+                let pause = if caught_up {
+                    Duration::from_secs(poll_interval_secs())
+                } else {
+                    Duration::from_secs(1)
+                };
+                fedimint_core::runtime::sleep(pause).await;
+            }
+        });
+    }
+
+    /// One bounded scan advance toward `target`: reads the next
+    /// `scan_batch_blocks`-sized range past the log's cursor (cold start:
+    /// `target - CANDIDATE_RETENTION_BLOCKS`), filters, records. Returns
+    /// whether it advanced (false = already caught up, or the RPC read
+    /// failed and will be retried next tick). Extracted from the spawn
+    /// loop so the advance/backfill/cursor logic is unit-testable.
+    async fn scan_step(
+        evm_rpc: &DynServerEvmRpc,
+        transfer_candidates: &Arc<Mutex<scan::CandidateLog>>,
+        target: u64,
+        usdt_contract: fedimint_usdt_common::EvmAddress,
+        group_public_key: &secp256k1::PublicKey,
+        scan_batch_blocks: u64,
+    ) -> bool {
+        let cursor = transfer_candidates
+            .lock()
+            .expect("not poisoned")
+            .scanned_to();
+        let from = if cursor == 0 {
+            target
+                .saturating_sub(scan::CANDIDATE_RETENTION_BLOCKS)
+                .max(1)
+        } else {
+            cursor.saturating_add(1)
+        };
+        if from > target {
+            return false;
+        }
+        let to = from
+            .saturating_add(scan_batch_blocks.saturating_sub(1))
+            .min(target);
+        debug_assert!(
+            to >= from,
+            "scan batch range must be non-empty: from={from} to={to}"
+        );
+        match rpc_deadline(evm_rpc.get_transfer_logs(usdt_contract, from, to)).await {
+            Ok(logs) => {
+                let found = scan::filter_scan_candidates(&logs, group_public_key);
+                debug_assert!(
+                    found
+                        .windows(2)
+                        .all(|w| w[0].block_number <= w[1].block_number),
+                    "scan batch results must be sorted by block_number: {found:?}"
+                );
+                // `CandidateLog::record_scan` assumes entries arrive in
+                // ascending block order and batches arrive in
+                // non-decreasing ranges (Task 5 review). Both hold here by
+                // construction: `from`/`to` only ever advance (the cursor
+                // is monotonic), and `eth_getLogs`/`filter_scan_candidates`
+                // preserve the underlying logs' block order.
+                transfer_candidates
+                    .lock()
+                    .expect("not poisoned")
+                    .record_scan(to, found);
+                true
+            }
+            Err(err) => {
+                debug!(
+                    target: "usdt",
+                    err = %err.fmt_compact_anyhow(),
+                    from, to,
+                    "transfer-scan read failed, retrying next tick"
+                );
+                false
+            }
+        }
     }
 
     /// Spawns the deposit-anchor self-heal watchdog. The deposit-by-proof
@@ -20865,6 +21042,38 @@ mod tests {
         assert_eq!(decoded_rec.swept, UsdtAmount(50));
         assert_eq!(decoded_rec.nonce, 1);
         assert_eq!(decoded_rec.fees_accrued, UsdtAmount(0));
+    }
+
+    /// `Usdt::scan_step` cold-start: with a fresh (never-scanned)
+    /// `CandidateLog`, the first batch begins `CANDIDATE_RETENTION_BLOCKS`
+    /// behind `target` rather than at block 1, so a guardian that starts
+    /// scanning against a chain already at height 100k backfills only the
+    /// retention window instead of the whole chain. `MockEvmRpc`'s
+    /// `get_transfer_logs` unconditionally returns no logs (see its impl
+    /// above), so this exercises the cursor/range arithmetic in isolation
+    /// from the filter predicate (covered separately in `scan.rs`'s tests).
+    #[tokio::test]
+    async fn scan_step_backfills_from_retention_floor_and_advances_cursor() {
+        let evm_rpc = MockEvmRpc::default().into_dyn();
+        let usdt_contract = EvmAddress([0x11; 20]);
+        let group_pk = test_pubkey(0x22);
+        let log = Arc::new(Mutex::new(scan::CandidateLog::default()));
+        let target = 100_000;
+        let batch = 50;
+
+        let advanced =
+            Usdt::scan_step(&evm_rpc, &log, target, usdt_contract, &group_pk, batch).await;
+
+        assert!(advanced);
+        // Cold start: the first batch spans
+        // [target - CANDIDATE_RETENTION_BLOCKS, .. + (batch - 1)], so the
+        // cursor lands `batch - 1` (not `batch`) past the retention floor --
+        // an inclusive `[from, to]` range of `batch` blocks advances the
+        // high-water mark by `batch - 1` relative to `from`.
+        assert_eq!(
+            log.lock().expect("not poisoned").scanned_to(),
+            target - scan::CANDIDATE_RETENTION_BLOCKS + (batch - 1)
+        );
     }
 }
 

@@ -308,6 +308,7 @@ pub(crate) async fn distributed_gen(
             local: UsdtConfigLocal {
                 evm_rpc_url: crate::config::default_evm_rpc_url(),
                 broadcaster_private_key: None,
+                scan_batch_blocks: crate::config::default_scan_batch_blocks(),
             },
         },
         consensus: UsdtConfigConsensus {

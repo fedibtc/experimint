@@ -83,6 +83,13 @@ pub struct UsdtConfigLocal {
     /// production. Never put on the wire or into consensus (see this
     /// struct's own doc comment).
     pub broadcaster_private_key: Option<String>,
+    /// Blocks per `eth_getLogs` Transfer-scan request (deposit discovery).
+    /// Guardian-local tuning: free public RPC tiers cap ranges anywhere
+    /// from ~10 blocks to thousands; 50 is safe on the majors. Raise it on
+    /// a self-hosted node to speed up cold-start backfill
+    /// (`CANDIDATE_RETENTION_BLOCKS / scan_batch_blocks` requests).
+    #[serde(default = "default_scan_batch_blocks")]
+    pub scan_batch_blocks: u64,
 }
 
 // `broadcaster_private_key` is secret key material (an EOA private key that
@@ -103,6 +110,7 @@ impl std::fmt::Debug for UsdtConfigLocal {
                 "broadcaster_private_key",
                 &self.broadcaster_private_key.as_ref().map(|_| "<redacted>"),
             )
+            .field("scan_batch_blocks", &self.scan_batch_blocks)
             .finish()
     }
 }
@@ -115,6 +123,15 @@ impl std::fmt::Debug for UsdtConfigLocal {
 /// mechanism lands (later phases).
 pub fn default_evm_rpc_url() -> String {
     "http://127.0.0.1:8545".to_string()
+}
+
+/// Default `scan_batch_blocks` (see [`UsdtConfigLocal::scan_batch_blocks`]):
+/// 50 blocks per `eth_getLogs` request, safe on the major public RPC
+/// providers' free tiers. Also the `#[serde(default)]` used to deserialize
+/// existing guardian config JSON predating this field, so rolling upgrades
+/// don't require a config migration.
+pub fn default_scan_batch_blocks() -> u64 {
+    50
 }
 
 /// The parameters every guardian in the federation agrees on.
@@ -192,7 +209,7 @@ plugin_types_trait_impl_config!(
 
 #[cfg(test)]
 mod tests {
-    use super::{UsdtConfigLocal, default_evm_rpc_url};
+    use super::{UsdtConfigLocal, default_evm_rpc_url, default_scan_batch_blocks};
 
     /// A guardian's broadcaster EOA private key is secret key material and
     /// must never appear in `Debug` output (which routinely reaches logs).
@@ -202,6 +219,7 @@ mod tests {
         let cfg = UsdtConfigLocal {
             evm_rpc_url: default_evm_rpc_url(),
             broadcaster_private_key: Some(secret.to_string()),
+            scan_batch_blocks: default_scan_batch_blocks(),
         };
 
         let rendered = format!("{cfg:?}");
@@ -224,6 +242,7 @@ mod tests {
         let cfg_none = UsdtConfigLocal {
             evm_rpc_url: default_evm_rpc_url(),
             broadcaster_private_key: None,
+            scan_batch_blocks: default_scan_batch_blocks(),
         };
         let rendered_none = format!("{cfg_none:?}");
         assert!(rendered_none.contains("None"));
@@ -239,6 +258,7 @@ mod tests {
         let cfg = UsdtConfigLocal {
             evm_rpc_url: format!("https://eth-mainnet.g.alchemy.com/v2/{secret}"),
             broadcaster_private_key: None,
+            scan_batch_blocks: default_scan_batch_blocks(),
         };
 
         let rendered = format!("{cfg:?}");
@@ -247,5 +267,22 @@ mod tests {
             !rendered.contains(secret),
             "RPC API key leaked into UsdtConfigLocal Debug output: {rendered}"
         );
+    }
+
+    /// Rolling-upgrade compatibility hinge: a guardian's existing local
+    /// config JSON, persisted before `scan_batch_blocks` existed, must still
+    /// deserialize -- filling in [`default_scan_batch_blocks`] rather than
+    /// failing to load on upgrade.
+    #[test]
+    fn local_config_deserializes_without_scan_batch_blocks_field() {
+        let json = format!(
+            r#"{{"evm_rpc_url":"{}","broadcaster_private_key":null}}"#,
+            default_evm_rpc_url()
+        );
+
+        let cfg: UsdtConfigLocal =
+            serde_json::from_str(&json).expect("must deserialize pre-existing config JSON");
+
+        assert_eq!(cfg.scan_batch_blocks, default_scan_batch_blocks());
     }
 }
