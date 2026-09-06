@@ -661,13 +661,17 @@ impl UsdtClientModule {
     /// later [`Self::submit_deposit_proof`] for its index can credit + mint
     /// against it).
     ///
-    /// Gap-limit scan: walks seed-derivation indices from `0`, deriving
-    /// [`Self::claim_keypair_for_index`] and querying the federation's
-    /// `deposit_status` for each. An index whose account has been credited
-    /// (`credited > 0`) is treated as used -- its claim key is re-stored
-    /// ([`ClaimKeyKey`]) and recorded in [`RecoverySummary::accounts`] -- and
-    /// resets the consecutive-miss counter; an uncredited index increments
-    /// it. The scan stops after `gap_limit` consecutive misses.
+    /// Gap-limit scan: walks seed-derivation indices from `0`, and at each
+    /// index probes BOTH the GROUND (discoverable) claim key
+    /// ([`Self::ground_claim_keypair_for_index`], what [`Self::allocate_deposit`]
+    /// hands out post-deposit-discovery) and the LEGACY (untweaked) base key
+    /// ([`Self::claim_keypair_for_index`], what pre-feature deposits were
+    /// allocated under) -- querying the federation's `deposit_status` for
+    /// each. An index whose account has been credited (`credited > 0`) under
+    /// EITHER key is treated as used -- that key is re-stored ([`ClaimKeyKey`])
+    /// and recorded in [`RecoverySummary::accounts`] -- and resets the
+    /// consecutive-miss counter; an index credited under neither key
+    /// increments it. The scan stops after `gap_limit` consecutive misses.
     ///
     /// If `check_uncredited` is set (security finding 08), every scanned
     /// index that reports `credited == 0` ALSO has its claim key persisted,
@@ -710,6 +714,7 @@ impl UsdtClientModule {
             &self.db,
             &*self.module_api,
             &self.module_root_secret,
+            &self.cfg,
             gap_limit,
             check_uncredited,
         )
@@ -721,10 +726,24 @@ impl UsdtClientModule {
     /// inherent method reading `self.module_api`) so it is unit-testable
     /// against a synthetic implementation without a live federation -- see
     /// the `mod tests` `FakeRecoveryApi`.
+    ///
+    /// Probes TWO keys per index (2026-09-06 design spec, deposit
+    /// discovery): the GROUND (discoverable) key
+    /// ([`Self::ground_claim_keypair_static`]) that
+    /// [`Self::allocate_deposit`] hands out post-feature, and the LEGACY
+    /// (untweaked) base key ([`Self::claim_keypair_static`]) that
+    /// pre-feature deposits were allocated under. `cfg` is needed to re-run
+    /// the identical grind ground-key allocation performed; when the ground
+    /// tweak is `0` the two keys coincide and only one probe is made. An
+    /// index counts as a hit (resets the miss counter, and can advance
+    /// `NextDepositIndexKey`) if EITHER probe is credited; the
+    /// `check_uncredited` persist-on-miss handling (security finding 08)
+    /// applies independently to each probe that is not credited.
     async fn recover_deposits_scan<A>(
         db: &Database,
         api: &A,
         module_root_secret: &DerivableSecret,
+        cfg: &UsdtClientConfig,
         gap_limit: u64,
         check_uncredited: bool,
     ) -> anyhow::Result<RecoverySummary>
@@ -740,52 +759,72 @@ impl UsdtClientModule {
 
         let mut index = 0u64;
         while consecutive_misses < gap_limit {
-            let claim_keypair = Self::claim_keypair_static(module_root_secret, index);
-            let claim_pk = claim_keypair.public_key();
-            let status = api.deposit_status(claim_pk).await?;
+            let base_keypair = Self::claim_keypair_static(module_root_secret, index);
+            // Probe BOTH forms at this index: the ground key (every
+            // allocation since deposit discovery shipped) and the legacy
+            // untweaked key (allocations that predate it). When the ground
+            // tweak is 0 the two coincide -- probe once.
+            let (tweak, ground_keypair, _ground_account) =
+                Self::ground_claim_keypair_static(cfg, &base_keypair).await?;
+            let mut probes = vec![ground_keypair];
+            if tweak != 0 {
+                probes.push(base_keypair);
+            }
 
-            if status.credited.0 > 0 {
-                let mut dbtx = db.begin_transaction().await;
-                dbtx.insert_entry(&ClaimKeyKey(status.account), &claim_keypair)
-                    .await;
-                dbtx.commit_tx().await;
+            let mut index_hit = false;
+            for claim_keypair in probes {
+                let claim_pk = claim_keypair.public_key();
+                let status = api.deposit_status(claim_pk).await?;
 
-                total_credited.0 = total_credited.0.saturating_add(status.credited.0);
-                total_claimable.0 = total_claimable.0.saturating_add(status.claimable.0);
-                accounts.push(RecoveredAccount {
-                    index,
-                    account: status.account,
-                    claim_pk,
-                    credited: status.credited,
-                    claimable: status.claimable,
-                });
-
-                highest_used_index = Some(index);
-                consecutive_misses = 0;
-            } else {
-                // Security finding 08: `deposit_status` alone cannot
-                // distinguish a truly unused index from one that was funded
-                // on-chain but not yet credited -- both report `credited == 0`
-                // here. Rather than silently discarding the index, persist its
-                // claim key when `check_uncredited` is set (so a follow-up
-                // `UsdtInput::DepositProofV0` proof submission can credit +
-                // mint it) -- this does NOT auto-credit (the caller still
-                // decides when to submit the proof), it only ensures the
-                // funds are not practically stranded. The miss counter still
-                // advances so the scan terminates at `gap_limit`.
-                if check_uncredited {
+                if status.credited.0 > 0 {
                     let mut dbtx = db.begin_transaction().await;
                     dbtx.insert_entry(&ClaimKeyKey(status.account), &claim_keypair)
                         .await;
                     dbtx.commit_tx().await;
 
-                    checked.push(CheckedAccount {
+                    total_credited.0 = total_credited.0.saturating_add(status.credited.0);
+                    total_claimable.0 = total_claimable.0.saturating_add(status.claimable.0);
+                    accounts.push(RecoveredAccount {
                         index,
                         account: status.account,
                         claim_pk,
+                        credited: status.credited,
+                        claimable: status.claimable,
                     });
-                }
 
+                    index_hit = true;
+                } else {
+                    // Security finding 08: `deposit_status` alone cannot
+                    // distinguish a truly unused index from one that was funded
+                    // on-chain but not yet credited -- both report `credited == 0`
+                    // here. Rather than silently discarding the index, persist its
+                    // claim key when `check_uncredited` is set (so a follow-up
+                    // `UsdtInput::DepositProofV0` proof submission can credit +
+                    // mint it) -- this does NOT auto-credit (the caller still
+                    // decides when to submit the proof), it only ensures the
+                    // funds are not practically stranded.
+                    if check_uncredited {
+                        let mut dbtx = db.begin_transaction().await;
+                        dbtx.insert_entry(&ClaimKeyKey(status.account), &claim_keypair)
+                            .await;
+                        dbtx.commit_tx().await;
+
+                        checked.push(CheckedAccount {
+                            index,
+                            account: status.account,
+                            claim_pk,
+                        });
+                    }
+                }
+            }
+
+            // Miss counting is per-INDEX: an index is a hit if EITHER probe
+            // was credited, and the miss counter still advances so the scan
+            // terminates at `gap_limit`.
+            if index_hit {
+                highest_used_index = Some(index);
+                consecutive_misses = 0;
+            } else {
                 consecutive_misses += 1;
             }
 
@@ -1844,7 +1883,7 @@ mod tests {
         Amount, Amounts, Database, DepositFeeQuoteResponse, DepositProof, DepositStatusResponse,
         EvmAddress, FEE_QUOTE_UNAVAILABLE_MESSAGE, IDatabaseTransactionOpsCoreTyped, Keypair,
         OutPoint, PeerId, PoolStateResponse, RefundStatusResponse, SECP256K1, StatusResponse,
-        USDT_UNIT, UsdtAmount, UsdtClientModule, UsdtFederationApi, UsdtInput,
+        USDT_UNIT, UsdtAmount, UsdtClientConfig, UsdtClientModule, UsdtFederationApi, UsdtInput,
         UserOpStatusResponse, WithdrawFeeQuoteResponse, WithdrawalStatusResponse, check_fee_cap,
         ensure_fee_quote_available, safe_scan_cursor, secp256k1,
     };
@@ -2178,6 +2217,28 @@ mod tests {
         }
     }
 
+    /// A synthetic [`UsdtClientConfig`] for exercising
+    /// [`UsdtClientModule::ground_claim_keypair_static`] (and, through it,
+    /// [`UsdtClientModule::recover_deposits_scan`]'s ground-key probing)
+    /// without a live federation. Field values are otherwise arbitrary --
+    /// only `group_public_key`/`account_factory`/`simple_account_impl` feed
+    /// the scan-tweak grind (see
+    /// [`fedimint_usdt_common::find_scan_tweak`]).
+    fn test_recovery_cfg() -> UsdtClientConfig {
+        UsdtClientConfig {
+            group_public_key: secp256k1::SecretKey::from_slice(&[0x11; 32])
+                .expect("valid scalar")
+                .public_key(SECP256K1),
+            network: fedimint_core::bitcoin::Network::Regtest,
+            usdt_contract: EvmAddress([0x77; 20]),
+            chain_id: 1,
+            confirmation_depth: 1,
+            entry_point: EvmAddress([0x88; 20]),
+            account_factory: EvmAddress([0x33; 20]),
+            simple_account_impl: EvmAddress([0x44; 20]),
+        }
+    }
+
     fn mem_db() -> Database {
         Database::new(MemDatabase::new(), ModuleDecoderRegistry::default())
     }
@@ -2295,6 +2356,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_persists_uncredited_indices_when_enabled() {
         let secret = DerivableSecret::new_root(b"usdt-recovery-uncredited-test-seed", b"salt");
+        let cfg = test_recovery_cfg();
         let db = mem_db();
 
         let claim_keypair0 = UsdtClientModule::claim_keypair_static(&secret, 0);
@@ -2305,25 +2367,28 @@ mod tests {
         let api = FakeRecoveryApi::new(responses);
 
         let gap_limit = 3;
-        let summary = UsdtClientModule::recover_deposits_scan(&db, &api, &secret, gap_limit, true)
-            .await
-            .expect("recovery must not fail even though nothing is credited");
+        let summary =
+            UsdtClientModule::recover_deposits_scan(&db, &api, &secret, &cfg, gap_limit, true)
+                .await
+                .expect("recovery must not fail even though nothing is credited");
 
         // Nothing was CREDITED, so the "recovered"/`accounts` side stays empty.
         assert_eq!(summary.recovered, 0);
         assert!(summary.accounts.is_empty());
 
         // Every scanned index (0..gap_limit, all misses) was persisted, index 0
-        // among them.
-        assert_eq!(
-            summary.checked.len(),
-            usize::try_from(gap_limit).expect("gap_limit fits in usize in this test")
+        // among them. Each miss index now probes the GROUND key in addition to
+        // this LEGACY (untweaked) one, so there is at least one checked entry
+        // per index (two whenever the ground tweak is nonzero).
+        assert!(
+            summary.checked.len()
+                >= usize::try_from(gap_limit).expect("gap_limit fits in usize in this test")
         );
         let checked0 = summary
             .checked
             .iter()
-            .find(|c| c.index == 0)
-            .expect("index 0 must be in the checked list");
+            .find(|c| c.index == 0 && c.claim_pk == claim_pk0)
+            .expect("index 0's LEGACY probe must be in the checked list");
         assert_eq!(checked0.account, account0);
         assert_eq!(checked0.claim_pk, claim_pk0);
 
@@ -2345,6 +2410,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_skips_uncredited_indices_when_check_uncredited_is_false() {
         let secret = DerivableSecret::new_root(b"usdt-recovery-opt-out-test-seed", b"salt");
+        let cfg = test_recovery_cfg();
         let db = mem_db();
 
         let claim_keypair0 = UsdtClientModule::claim_keypair_static(&secret, 0);
@@ -2355,9 +2421,10 @@ mod tests {
         let api = FakeRecoveryApi::new(responses);
 
         let gap_limit = 3;
-        let summary = UsdtClientModule::recover_deposits_scan(&db, &api, &secret, gap_limit, false)
-            .await
-            .expect("recovery must not fail");
+        let summary =
+            UsdtClientModule::recover_deposits_scan(&db, &api, &secret, &cfg, gap_limit, false)
+                .await
+                .expect("recovery must not fail");
 
         assert!(summary.checked.is_empty());
 
@@ -2375,6 +2442,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_advances_next_deposit_index_only_past_credited_indices() {
         let secret = DerivableSecret::new_root(b"usdt-recovery-index-advance-test-seed", b"salt");
+        let cfg = test_recovery_cfg();
         let db = mem_db();
 
         let claim_keypair0 = UsdtClientModule::claim_keypair_static(&secret, 0);
@@ -2392,15 +2460,19 @@ mod tests {
         let api = FakeRecoveryApi::new(responses);
 
         let gap_limit = 3;
-        let summary = UsdtClientModule::recover_deposits_scan(&db, &api, &secret, gap_limit, true)
-            .await
-            .expect("recovery must not fail");
+        let summary =
+            UsdtClientModule::recover_deposits_scan(&db, &api, &secret, &cfg, gap_limit, true)
+                .await
+                .expect("recovery must not fail");
 
         assert_eq!(summary.recovered, 1);
-        // Indices 1..=3 are misses (checked but uncredited).
-        assert_eq!(
-            summary.checked.len(),
-            usize::try_from(gap_limit).expect("gap_limit fits in usize in this test")
+        // Indices 1..=3 are misses (checked but uncredited); index 0's GROUND
+        // probe (distinct from its credited LEGACY key whenever the ground
+        // tweak is nonzero) also lands in `checked`, so there are at least
+        // `gap_limit` entries.
+        assert!(
+            summary.checked.len()
+                >= usize::try_from(gap_limit).expect("gap_limit fits in usize in this test")
         );
 
         let mut dbtx = db.begin_transaction_nc().await;
@@ -2412,5 +2484,113 @@ mod tests {
             next_index, 1,
             "NextDepositIndexKey must advance only past the highest CREDITED index"
         );
+    }
+
+    /// The 2026-09-06 deposit-discovery design spec: `allocate_deposit` now
+    /// hands out the GROUND (discoverable) claim key -- base key plus the
+    /// smallest scan tweak whose deposit address is
+    /// [`fedimint_usdt_common::is_potential_deposit`] -- while deposits
+    /// allocated before that feature shipped are still credited under their
+    /// LEGACY (untweaked) key. `recover_deposits_scan` must probe BOTH forms
+    /// per index so seed-only recovery finds deposits from either era: a
+    /// GROUND-key deposit at index 0 and a LEGACY-key deposit at index 1,
+    /// both credited, must both be recovered, both `ClaimKeyKey`s persisted,
+    /// and `NextDepositIndexKey` advanced to 2 (one past the highest
+    /// CREDITED index).
+    #[tokio::test]
+    async fn recovery_probes_both_ground_and_legacy_claim_keys() {
+        let secret = DerivableSecret::new_root(b"usdt-recovery-ground-legacy-test-seed", b"salt");
+        let cfg = test_recovery_cfg();
+        let db = mem_db();
+
+        // Index 0: a POST-feature deposit, credited under the GROUND key
+        // (mirrors `allocate_deposit`'s `ground_claim_keypair_for_index`).
+        let base0 = UsdtClientModule::claim_keypair_static(&secret, 0);
+        let (_tweak0, ground_keypair0, ground_account0) =
+            UsdtClientModule::ground_claim_keypair_static(&cfg, &base0)
+                .await
+                .expect("grind must find a tweak within MAX_SCAN_GRIND_ITERATIONS");
+        let ground_pk0 = ground_keypair0.public_key();
+
+        // Index 1: a PRE-feature deposit, credited under the LEGACY
+        // (untweaked) key -- what every deposit used before ground-key
+        // discovery shipped.
+        let legacy_keypair1 = UsdtClientModule::claim_keypair_static(&secret, 1);
+        let legacy_pk1 = legacy_keypair1.public_key();
+        let legacy_account1 = EvmAddress([0x99; 20]);
+
+        let mut responses = BTreeMap::new();
+        responses.insert(
+            ground_pk0,
+            DepositStatusResponse {
+                account: ground_account0,
+                credited: UsdtAmount(1_000_000),
+                claimed: UsdtAmount(0),
+                claimable: UsdtAmount(1_000_000),
+            },
+        );
+        responses.insert(
+            legacy_pk1,
+            DepositStatusResponse {
+                account: legacy_account1,
+                credited: UsdtAmount(2_000_000),
+                claimed: UsdtAmount(0),
+                claimable: UsdtAmount(2_000_000),
+            },
+        );
+        let api = FakeRecoveryApi::new(responses);
+
+        let gap_limit = 3;
+        let summary =
+            UsdtClientModule::recover_deposits_scan(&db, &api, &secret, &cfg, gap_limit, false)
+                .await
+                .expect("recovery must not fail");
+
+        assert_eq!(
+            summary.recovered, 2,
+            "both the ground-key deposit (index 0) and the legacy-key deposit \
+             (index 1) must be recovered"
+        );
+        assert_eq!(summary.total_credited, UsdtAmount(3_000_000));
+        assert_eq!(summary.total_claimable, UsdtAmount(3_000_000));
+
+        let recovered0 = summary
+            .accounts
+            .iter()
+            .find(|a| a.index == 0)
+            .expect("index 0 (ground-key deposit) must be in the recovered accounts");
+        assert_eq!(recovered0.claim_pk, ground_pk0);
+        assert_eq!(recovered0.account, ground_account0);
+
+        let recovered1 = summary
+            .accounts
+            .iter()
+            .find(|a| a.index == 1)
+            .expect("index 1 (legacy-key deposit) must be in the recovered accounts");
+        assert_eq!(recovered1.claim_pk, legacy_pk1);
+        assert_eq!(recovered1.account, legacy_account1);
+
+        // Both claim keys must be persisted so a follow-up claim can sign
+        // against them.
+        let mut dbtx = db.begin_transaction_nc().await;
+        let stored_ground0 = dbtx
+            .get_value(&ClaimKeyKey(ground_account0))
+            .await
+            .expect("the ground claim key for index 0 must be persisted");
+        assert_eq!(stored_ground0.public_key(), ground_pk0);
+        let stored_legacy1 = dbtx
+            .get_value(&ClaimKeyKey(legacy_account1))
+            .await
+            .expect("the legacy claim key for index 1 must be persisted");
+        assert_eq!(stored_legacy1.public_key(), legacy_pk1);
+
+        // NextDepositIndexKey must advance to one past the highest CREDITED
+        // index (1), i.e. to 2, so a later `allocate_deposit` does not
+        // collide with either recovered deposit.
+        let next_index = dbtx
+            .get_value(&NextDepositIndexKey)
+            .await
+            .expect("NextDepositIndexKey must be set after a credited recovery");
+        assert_eq!(next_index, 2);
     }
 }
