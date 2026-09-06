@@ -110,6 +110,7 @@ pub mod db;
 pub mod factory_bytecode;
 pub mod proof;
 pub mod rpc;
+pub mod scan;
 pub mod signing;
 pub mod user_op;
 
