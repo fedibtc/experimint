@@ -54,6 +54,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use states::{UsdtStateMachine, WithdrawalRefundCommon, WithdrawalRefundState};
 use strum::IntoEnumIterator;
+use thiserror::Error;
 use tracing::debug;
 
 pub mod api;
@@ -171,6 +172,36 @@ fn check_fee_cap(
     }
 
     Ok(())
+}
+
+/// Returned by [`UsdtClientModule::submit_prebuilt_deposit_proof`] when
+/// `proven` proves nothing new over the account's already-`credited`
+/// balance (`delta == 0`) -- the same "nothing to claim" condition an
+/// unfunded (or already-fully-claimed) deposit account produces. A distinct,
+/// structured error type (rather than a bare `bail!` string) so
+/// [`UsdtClientModule::submit_deposit_proof`]'s dual-probe fallback (ground
+/// key first, legacy key second -- see its doc comment) can detect this
+/// SPECIFIC condition via [`anyhow::Error::downcast_ref`] instead of
+/// string-matching the rendered message, while every other failure (RPC
+/// errors, fee-cap rejections, an unanchored ring, ...) still propagates
+/// without triggering the legacy-key retry.
+#[derive(Debug, Clone, Error)]
+#[error(
+    "deposit proof proves {proven} but {credited} is already credited for {account}; nothing \
+     new to credit"
+)]
+struct NothingNewToCreditError {
+    account: EvmAddress,
+    proven: UsdtAmount,
+    credited: UsdtAmount,
+}
+
+/// `true` if `err` is (or wraps) a [`NothingNewToCreditError`] -- the
+/// "nothing to claim" class of failure [`UsdtClientModule::submit_deposit_proof`]'s
+/// dual-probe fallback treats as "this key is unfunded/fully-claimed, try
+/// the other one" rather than a fatal error to propagate immediately.
+fn is_nothing_new_to_credit_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NothingNewToCreditError>().is_some()
 }
 
 #[derive(Debug)]
@@ -529,6 +560,23 @@ impl UsdtClientModule {
     ) -> anyhow::Result<(u64, Keypair, EvmAddress)> {
         let base = self.claim_keypair_for_index(index);
         Self::ground_claim_keypair_static(&self.cfg, &base).await
+    }
+
+    /// Test-only accessor for [`Self::ground_claim_keypair_for_index`]:
+    /// exposes the ground (discoverable) keypair derivation so a hermetic
+    /// integration test can assert it agrees with what
+    /// [`Self::allocate_deposit`] actually funded/persisted -- the invariant
+    /// [`Self::submit_deposit_proof`]'s primary (ground-key) probe relies on.
+    /// Gated behind the non-default `test-util` feature (never compiled into
+    /// the release image) and `#[doc(hidden)]` so it does not appear in
+    /// generated docs as public API.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub async fn ground_claim_keypair_for_index_for_test(
+        &self,
+        index: u64,
+    ) -> anyhow::Result<(u64, Keypair, EvmAddress)> {
+        self.ground_claim_keypair_for_index(index).await
     }
 
     /// The deterministic withdrawal-refund keypair for seed-derivation `index`,
@@ -1022,12 +1070,42 @@ impl UsdtClientModule {
     /// submitting it as a [`UsdtInput::DepositProofV0`] (deposit-by-proof,
     /// Task 9). Returns the submitted transaction's [`OperationId`].
     ///
-    /// Flow:
-    /// 1. Derive the `index`'s claim key + deposit `account`
-    ///    ([`Self::claim_keypair_for_index`]/[`Self::deposit_address`]) and
-    ///    persist the claim key ([`ClaimKeyKey`]) so the deposit is
-    ///    recoverable/claimable exactly as [`Self::allocate_deposit`] leaves
-    ///    it.
+    /// DUAL-PROBE by key (mirrors [`Self::recover_deposits_scan`]'s
+    /// ground-then-legacy semantics, Task 10 / Task 11): since deposit
+    /// discovery shipped, [`Self::allocate_deposit`] hands out (and funds) the
+    /// GROUND (discoverable) key ([`Self::ground_claim_keypair_for_index`]) --
+    /// the base seed-derived key plus a grind tweak -- not the plain base key
+    /// ([`Self::claim_keypair_for_index`]). So `index` alone is ambiguous
+    /// about which key was actually funded:
+    ///
+    /// 1. Derive the GROUND keypair for `index`
+    ///    ([`Self::ground_claim_keypair_for_index`]) and attempt the full
+    ///    proof-fetch + submit flow with it
+    ///    ([`Self::submit_deposit_proof_with_keypair`]). This is the primary
+    ///    probe -- correct for every deposit allocated post-discovery.
+    /// 2. If that attempt fails with the "nothing new to credit" class of
+    ///    error ([`NothingNewToCreditError`], detected via
+    ///    [`is_nothing_new_to_credit_error`] rather than string-matching) AND
+    ///    the ground tweak is nonzero (i.e. the LEGACY untweaked key at this
+    ///    index actually differs from the ground one), fall back to
+    ///    attempting the LEGACY keypair ([`Self::claim_keypair_for_index`])
+    ///    instead -- this keeps pre-discovery deposits (funded at the
+    ///    untweaked address, before this client ever ground a tweak) claimable
+    ///    by index.
+    /// 3. If both probes fail, the GROUND attempt's error is returned
+    ///    (annotated to note the legacy fallback was also tried), since it is
+    ///    the primary/expected key for any deposit allocated by this or a
+    ///    newer client.
+    ///
+    /// Any OTHER failure from the ground probe (RPC errors, an unanchored
+    /// ring, a fee-cap rejection, ...) is NOT retried against the legacy key
+    /// -- it propagates immediately, exactly as a single-key attempt would.
+    ///
+    /// Flow (per probe):
+    /// 1. Derive the probe's claim key + deposit `account`
+    ///    ([`Self::deposit_address`]) and persist the claim key
+    ///    ([`ClaimKeyKey`]) so the deposit is recoverable/claimable exactly as
+    ///    [`Self::allocate_deposit`] leaves it.
     /// 2. Ask the federation for its newest anchored, confirmation-deep block
     ///    ([`Self::latest_anchored_block`]) and target the proof at it (the
     ///    ring only ever holds already-confirmed heights, so `latest` is a safe
@@ -1054,9 +1132,9 @@ impl UsdtClientModule {
     ///
     /// Returns an `Err` if the ring has anchored no block yet, the RPC calls
     /// fail, the header reconstruction does not hash to the block's own hash,
-    /// the proof proves nothing new over what is already credited, the fee
-    /// quote is unavailable or fails the [`check_fee_cap`] guard, or the fee
-    /// would consume the whole newly-proven delta.
+    /// both probes' proofs prove nothing new over what is already credited,
+    /// the fee quote is unavailable or fails the [`check_fee_cap`] guard, or
+    /// the fee would consume the whole newly-proven delta.
     pub async fn submit_deposit_proof(
         &self,
         index: u64,
@@ -1064,14 +1142,46 @@ impl UsdtClientModule {
         max_deposit_fee: Option<UsdtAmount>,
         accept_high_fee: bool,
     ) -> anyhow::Result<OperationId> {
-        let claim_keypair = self.claim_keypair_for_index(index);
-        self.submit_deposit_proof_with_keypair(
-            claim_keypair,
-            evm_rpc_url,
-            max_deposit_fee,
-            accept_high_fee,
-        )
-        .await
+        let (ground_tweak, ground_keypair, _ground_account) =
+            self.ground_claim_keypair_for_index(index).await?;
+
+        let ground_err = match self
+            .submit_deposit_proof_with_keypair(
+                ground_keypair,
+                evm_rpc_url.clone(),
+                max_deposit_fee,
+                accept_high_fee,
+            )
+            .await
+        {
+            Ok(op) => return Ok(op),
+            Err(err) => err,
+        };
+
+        // Only retry the legacy (untweaked) key when the ground probe failed
+        // for exactly the "nothing to claim" reason AND the two keys actually
+        // differ (a zero tweak means they coincide -- retrying would just
+        // repeat the same failed attempt).
+        if ground_tweak == 0 || !is_nothing_new_to_credit_error(&ground_err) {
+            return Err(ground_err);
+        }
+
+        let legacy_keypair = self.claim_keypair_for_index(index);
+        match self
+            .submit_deposit_proof_with_keypair(
+                legacy_keypair,
+                evm_rpc_url,
+                max_deposit_fee,
+                accept_high_fee,
+            )
+            .await
+        {
+            Ok(op) => Ok(op),
+            Err(legacy_err) => Err(ground_err.context(format!(
+                "ground (discoverable) claim key had nothing new to credit; legacy (untweaked) \
+                 claim key fallback also failed: {legacy_err}"
+            ))),
+        }
     }
 
     /// The transport half of [`Self::submit_deposit_proof`], addressed by
@@ -1221,11 +1331,12 @@ impl UsdtClientModule {
         let status = self.module_api.deposit_status(claim_pk).await?;
         let delta = proven.0.saturating_sub(status.credited.0);
         if delta == 0 {
-            bail!(
-                "deposit proof proves {proven} but {} is already credited for {account}; nothing \
-                 new to credit",
-                status.credited,
-            );
+            return Err(NothingNewToCreditError {
+                account,
+                proven,
+                credited: status.credited,
+            }
+            .into());
         }
 
         // Security finding 07: the fee-cap guard runs against the freshly
@@ -1886,10 +1997,11 @@ mod tests {
     use super::{
         Amount, Amounts, Database, DepositFeeQuoteResponse, DepositProof, DepositStatusResponse,
         EvmAddress, FEE_QUOTE_UNAVAILABLE_MESSAGE, IDatabaseTransactionOpsCoreTyped, Keypair,
-        OutPoint, PeerId, PoolStateResponse, RefundStatusResponse, SECP256K1, StatusResponse,
-        USDT_UNIT, UsdtAmount, UsdtClientConfig, UsdtClientModule, UsdtFederationApi, UsdtInput,
-        UserOpStatusResponse, WithdrawFeeQuoteResponse, WithdrawalStatusResponse, check_fee_cap,
-        ensure_fee_quote_available, safe_scan_cursor, secp256k1,
+        NothingNewToCreditError, OutPoint, PeerId, PoolStateResponse, RefundStatusResponse,
+        SECP256K1, StatusResponse, USDT_UNIT, UsdtAmount, UsdtClientConfig, UsdtClientModule,
+        UsdtFederationApi, UsdtInput, UserOpStatusResponse, WithdrawFeeQuoteResponse,
+        WithdrawalStatusResponse, check_fee_cap, ensure_fee_quote_available,
+        is_nothing_new_to_credit_error, safe_scan_cursor, secp256k1,
     };
     use crate::db::{ClaimKeyKey, NextDepositIndexKey};
 
@@ -1935,6 +2047,47 @@ mod tests {
         let quote = UsdtAmount(38_880_000);
         let passed = ensure_fee_quote_available(quote, true).expect("available quote must pass");
         assert_eq!(passed, quote);
+    }
+
+    /// Task 11 regression fix: [`is_nothing_new_to_credit_error`] must
+    /// recognize a [`NothingNewToCreditError`] wrapped in an `anyhow::Error`
+    /// -- this is exactly the condition
+    /// [`UsdtClientModule::submit_deposit_proof`]'s dual-probe fallback keys
+    /// its ground-key-failed/try-legacy-key decision on.
+    #[test]
+    fn nothing_new_to_credit_error_is_recognized_through_anyhow() {
+        let err: anyhow::Error = NothingNewToCreditError {
+            account: EvmAddress([0x11; 20]),
+            proven: UsdtAmount(1_000_000),
+            credited: UsdtAmount(1_000_000),
+        }
+        .into();
+        assert!(
+            is_nothing_new_to_credit_error(&err),
+            "a bare NothingNewToCreditError must be recognized"
+        );
+
+        // Still recognized after being wrapped in extra `.context(..)`, since
+        // `submit_deposit_proof`'s ground probe error can pick up context
+        // from callers before the dual-probe fallback inspects it.
+        let wrapped = err.context("submit_deposit_proof_with_keypair failed");
+        assert!(
+            is_nothing_new_to_credit_error(&wrapped),
+            "a NothingNewToCreditError must still be recognized under added anyhow context"
+        );
+    }
+
+    /// Negative control: an unrelated error (e.g. an RPC failure or a
+    /// fee-cap rejection) must NOT be classified as "nothing to claim" --
+    /// otherwise `submit_deposit_proof`'s dual-probe fallback would mask a
+    /// real infrastructure failure by silently retrying the legacy key.
+    #[test]
+    fn unrelated_error_is_not_nothing_new_to_credit() {
+        let err = anyhow::anyhow!("federation has not anchored any confirmation-deep block yet");
+        assert!(
+            !is_nothing_new_to_credit_error(&err),
+            "an unrelated error must not be mistaken for the nothing-to-claim condition"
+        );
     }
 
     /// [`UsdtClientModule::deposit_proof_input`] must build a `DepositProofV0`

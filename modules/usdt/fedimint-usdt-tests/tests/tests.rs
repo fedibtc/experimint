@@ -261,6 +261,73 @@ async fn allocated_deposit_addresses_satisfy_scan_predicate() -> anyhow::Result<
     Ok(())
 }
 
+/// Task 11 regression pin (cross-task regression fixed alongside this test):
+/// since commit 9b4f3bb, `allocate_deposit` funds the GROUND (discoverable,
+/// tweaked) claim key -- not the plain seed-derived base key -- for a newly
+/// allocated index. `submit_deposit_proof(index, ...)`'s PRIMARY probe must
+/// derive that exact same ground key, or it proves the balance of the wrong
+/// (unfunded) address and every index-based claim of a freshly allocated
+/// deposit fails with "nothing new to credit" (see
+/// `credit_deposit_via_anvil_proof` in `common::proof`, exercised end-to-end
+/// by `full_topology_e2e`). This is a cheap, hermetic (no network) derivation
+/// check that pins the invariant directly: the account
+/// [`UsdtClientModule::allocate_deposit`] hands out for a fresh index must be
+/// byte-identical to what
+/// [`UsdtClientModule::ground_claim_keypair_for_index_for_test`] (the
+/// `test-util` accessor for `submit_deposit_proof`'s primary probe
+/// derivation) computes for that same index.
+#[tokio::test(flavor = "multi_thread")]
+async fn allocate_deposit_account_matches_ground_key_derivation_for_index_claims()
+-> anyhow::Result<()> {
+    let mock = Arc::new(MockEvmRpc::new());
+    mock.set_chain_id(31337);
+    mock.set_block_number(100);
+    let scripted_fee = FeeVote {
+        max_fee_per_gas_wei: 1_000_000_000,
+        usdt_per_eth_e6: 3_000_000_000,
+    };
+    mock.set_fee_estimate(scripted_fee);
+
+    let fed = dual_mint_fixtures(mock.clone())
+        .new_fed_builder(0)
+        .disable_mint_fees()
+        .build()
+        .await;
+    let client: ClientHandleArc = fed.new_client().await;
+    let usdt = client.get_first_module::<UsdtClientModule>()?;
+
+    let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        usdt.config().entry_point,
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
+    );
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
+
+    // A fresh client's very first `allocate_deposit` always lands at index 0
+    // (`NextDepositIndexKey` defaults to 0), so the index-claim path's
+    // primary probe for index 0 must derive this exact funded account.
+    let (claim_keypair, funded_account) = usdt.allocate_deposit().await?;
+    let (_tweak, ground_keypair, ground_account) =
+        usdt.ground_claim_keypair_for_index_for_test(0).await?;
+
+    assert_eq!(
+        funded_account, ground_account,
+        "submit_deposit_proof's primary (ground-key) probe must target the exact account \
+         allocate_deposit funded, or it proves the balance of the wrong, unfunded address"
+    );
+    assert_eq!(
+        claim_keypair.public_key(),
+        ground_keypair.public_key(),
+        "allocate_deposit's persisted claim key must be the same ground key submit_deposit_proof \
+         re-derives for the same index"
+    );
+
+    Ok(())
+}
+
 /// **Phase 5 gating acceptance test.** Drives the full deposit -> claim ->
 /// USDT-denominated e-cash flow over a hermetic in-process federation: a
 /// shared [`MockEvmRpc`] stands in for the EVM chain (every guardian reads
