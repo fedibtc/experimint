@@ -845,10 +845,7 @@ fn create2_simple_account(
 /// holding the public `group_public_key` can tag matching addresses as
 /// probable deposits of this federation.
 #[must_use]
-pub fn is_potential_deposit(
-    group_public_key: &secp256k1::PublicKey,
-    account: &EvmAddress,
-) -> bool {
+pub fn is_potential_deposit(group_public_key: &secp256k1::PublicKey, account: &EvmAddress) -> bool {
     let mut hasher = Keccak256::new();
     hasher.update(SCAN_PREDICATE_DOMAIN);
     hasher.update(group_public_key.serialize());
@@ -2332,7 +2329,10 @@ mod tests {
             .flat_map(|x| (0u8..4).map(move |y| EvmAddress([x ^ y; 20])))
             .filter(|addr| is_potential_deposit(&group_pk, addr))
             .count();
-        assert!(hits <= 2, "predicate should hit ~1 in 2^16, got {hits}/1024");
+        assert!(
+            hits <= 2,
+            "predicate should hit ~1 in 2^16, got {hits}/1024"
+        );
     }
 
     #[test]
