@@ -672,6 +672,10 @@ impl UsdtClientModule {
     /// and recorded in [`RecoverySummary::accounts`] -- and resets the
     /// consecutive-miss counter; an index credited under neither key
     /// increments it. The scan stops after `gap_limit` consecutive misses.
+    /// Deriving the ground key pays [`Self::ground_claim_keypair_static`]'s
+    /// sub-second grind once per scanned index, so a miss-heavy recovery
+    /// (e.g. hitting the full `gap_limit`) pays roughly `gap_limit` grinds
+    /// rather than being free index derivation.
     ///
     /// If `check_uncredited` is set (security finding 08), every scanned
     /// index that reports `credited == 0` ALSO has its claim key persisted,
@@ -2243,6 +2247,30 @@ mod tests {
         Database::new(MemDatabase::new(), ModuleDecoderRegistry::default())
     }
 
+    /// The number of `deposit_status` probes
+    /// [`UsdtClientModule::recover_deposits_scan`] makes at seed-derivation
+    /// `index` under `secret`/`cfg`: 2 (ground key + legacy base key) unless
+    /// the ground scan tweak happens to be `0`, in which case the two keys
+    /// coincide and the scan makes only 1 probe (mirrors the production
+    /// `if tweak != 0` dedup gate exactly). The grind is fully deterministic
+    /// for a fixed `secret`/`cfg`/`index`, so tests can use this to compute
+    /// an EXACT expected `checked`/probe count instead of a loose bound --
+    /// pinning the real bookkeeping (a regression that lost the dedup gate,
+    /// pushed a spurious extra `checked` entry, or extended the scan by one
+    /// index would all change this count).
+    async fn probe_count_at_index(
+        cfg: &UsdtClientConfig,
+        secret: &DerivableSecret,
+        index: u64,
+    ) -> usize {
+        let base = UsdtClientModule::claim_keypair_static(secret, index);
+        let (tweak, _ground_keypair, _ground_account) =
+            UsdtClientModule::ground_claim_keypair_static(cfg, &base)
+                .await
+                .expect("grind must find a tweak within MAX_SCAN_GRIND_ITERATIONS");
+        if tweak == 0 { 1 } else { 2 }
+    }
+
     /// A synthetic [`UsdtFederationApi`] for exercising
     /// [`UsdtClientModule::recover_deposits_scan`] without a live federation.
     /// Only `deposit_status` is exercised by the scan loop; every other trait
@@ -2378,12 +2406,16 @@ mod tests {
 
         // Every scanned index (0..gap_limit, all misses) was persisted, index 0
         // among them. Each miss index now probes the GROUND key in addition to
-        // this LEGACY (untweaked) one, so there is at least one checked entry
-        // per index (two whenever the ground tweak is nonzero).
-        assert!(
-            summary.checked.len()
-                >= usize::try_from(gap_limit).expect("gap_limit fits in usize in this test")
-        );
+        // this LEGACY (untweaked) one, so the exact expected count is the sum
+        // of per-index probe counts (2 unless that index's ground tweak
+        // happens to be 0, in which case the two keys coincide and only 1
+        // probe is made) -- computed here rather than hard-coded so the
+        // assertion stays exact (not just a lower bound) and self-explanatory.
+        let mut expected_checked = 0usize;
+        for index in 0..gap_limit {
+            expected_checked += probe_count_at_index(&cfg, &secret, index).await;
+        }
+        assert_eq!(summary.checked.len(), expected_checked);
         let checked0 = summary
             .checked
             .iter()
@@ -2466,14 +2498,19 @@ mod tests {
                 .expect("recovery must not fail");
 
         assert_eq!(summary.recovered, 1);
-        // Indices 1..=3 are misses (checked but uncredited); index 0's GROUND
-        // probe (distinct from its credited LEGACY key whenever the ground
-        // tweak is nonzero) also lands in `checked`, so there are at least
-        // `gap_limit` entries.
-        assert!(
-            summary.checked.len()
-                >= usize::try_from(gap_limit).expect("gap_limit fits in usize in this test")
-        );
+        // Indices 1..=3 are pure misses (checked but uncredited), each
+        // contributing its full per-index probe count. Index 0 is a hit via
+        // its LEGACY probe, but its GROUND probe (distinct whenever that
+        // index's ground tweak is nonzero) still lands in `checked` -- so
+        // index 0 contributes its probe count MINUS the one credited probe.
+        // Computed exactly (not just a lower bound) via the same grind the
+        // production scan runs, so the assertion pins the real bookkeeping.
+        let index0_probes = probe_count_at_index(&cfg, &secret, 0).await;
+        let mut expected_checked = index0_probes - 1;
+        for index in 1..=gap_limit {
+            expected_checked += probe_count_at_index(&cfg, &secret, index).await;
+        }
+        assert_eq!(summary.checked.len(), expected_checked);
 
         let mut dbtx = db.begin_transaction_nc().await;
         let next_index = dbtx
