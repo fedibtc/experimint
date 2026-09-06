@@ -70,3 +70,15 @@ pub const USDT_STATUS_ENDPOINT: &str = "usdt_status";
 /// not-yet-anchored. Read from consensus DB, so any guardian answers
 /// identically, mirroring [`USDT_STATUS_ENDPOINT`]/[`POOL_STATE_ENDPOINT`].
 pub const LATEST_ANCHORED_BLOCK_ENDPOINT: &str = "latest_anchored_block";
+
+/// Streams plausible incoming deposits (confirmed USDT `Transfer`s whose
+/// recipient satisfies `is_potential_deposit`) observed above the client's
+/// cursor. GUARDIAN-LOCAL — deliberately NOT read from consensus DB, unlike
+/// every other endpoint in this file: each guardian answers from its own
+/// in-memory Transfer-log scan, so answers differ across peers (and are
+/// empty right after a restart until the backfill catches up). Clients MUST
+/// NOT use `request_current_consensus` here; they query peers individually
+/// and union the responses (see
+/// `fedimint-usdt-client`'s `discover_deposits`). Added at `ApiVersion`
+/// (0, 1) — the deposit-discovery feature.
+pub const TRANSFER_CANDIDATES_ENDPOINT: &str = "transfer_candidates";

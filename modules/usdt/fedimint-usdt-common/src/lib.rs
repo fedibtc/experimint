@@ -1283,6 +1283,42 @@ pub struct AnchoredBlockResponse {
     pub window: u64,
 }
 
+/// One plausible incoming deposit surfaced by a guardian's Transfer-log
+/// scan (see `TRANSFER_CANDIDATES_ENDPOINT`): a confirmed USDT `Transfer`
+/// whose `to` address satisfies [`is_potential_deposit`]. A HINT, not a
+/// credit — the client matches `to` against its own derived addresses and,
+/// on a match, runs the unchanged deposit-proof claim flow. False entries
+/// (predicate collisions, or transfers unrelated to this federation) are
+/// harmless: they simply fail to match any client key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct TransferCandidate {
+    /// Confirmed block the transfer was observed in.
+    pub block_number: u64,
+    /// The transfer's recipient (a predicate-matching address).
+    pub to: EvmAddress,
+    /// Transferred amount (saturated to `u64`; USDT has 6 decimals).
+    pub value: UsdtAmount,
+}
+
+/// Request for `TRANSFER_CANDIDATES_ENDPOINT`: candidates observed in
+/// blocks strictly above `since_block` (the client's persisted cursor).
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct TransferCandidatesRequest {
+    pub since_block: u64,
+}
+
+/// Response for `TRANSFER_CANDIDATES_ENDPOINT`. `scanned_to` is the highest
+/// block THIS guardian's scan has fully covered; the client advances its
+/// cursor only to a height at least `max_evil + 1` responding guardians
+/// have covered (so one honest guardian vouches for it).
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct TransferCandidatesResponse {
+    /// Ascending block order, capped server-side; re-query with a higher
+    /// `since_block` to page.
+    pub candidates: Vec<TransferCandidate>,
+    pub scanned_to: u64,
+}
+
 /// Request for the [`UserOpStatus`] of a specific `UserOp`, identified by its
 /// [`user_op::user_op_hash`].
 #[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
