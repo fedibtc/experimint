@@ -9,7 +9,7 @@ use std::ffi;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use api::UsdtFederationApi;
 use db::{
     ClaimKeyKey, ClaimKeyPrefixAll, DbKeyPrefix, EvmRpcUrlKey, EvmRpcUrlPrefixAll,
@@ -44,9 +44,10 @@ pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
     BootstrapState, DepositFeeQuoteResponse, DepositProof, DepositStatusResponse, EvmAddress, KIND,
-    PoolStateResponse, RefundStatusResponse, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
-    UsdtInput, UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse,
-    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse, usdt_amount,
+    MAX_SCAN_GRIND_ITERATIONS, PoolStateResponse, RefundStatusResponse, StatusResponse, USDT_UNIT,
+    UsdtAmount, UsdtCommonInit, UsdtInput, UsdtModuleTypes, UsdtOutput, UsdtOutputV0,
+    UserOpStatusResponse, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse,
+    find_scan_tweak, scan_tweak_scalar, usdt_amount,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -436,6 +437,65 @@ impl UsdtClientModule {
         Self::claim_keypair_static(&self.module_root_secret, index)
     }
 
+    /// Chunk size between executor yields while grinding a scan tweak.
+    const SCAN_GRIND_CHUNK: u64 = 256;
+
+    /// The DISCOVERABLE claim keypair for base key `base`: `base` plus the
+    /// smallest additive tweak whose deposit address (under `cfg`) satisfies
+    /// [`fedimint_usdt_common::is_potential_deposit`] (deposit discovery; see
+    /// the 2026-09-06 design spec). Deterministic given `base` -- recovery
+    /// re-runs the identical grind starting from the same seed-derived base
+    /// key (see [`Self::claim_keypair_static`]) -- and cheap (~2^16 point-adds
+    /// + keccaks, sub-second), chunked with yields for wasm.
+    ///
+    /// Static (mirrors [`Self::claim_keypair_static`]) so a future
+    /// seed-only recovery scan (no live `Self`) can re-derive the exact same
+    /// ground keys as [`Self::ground_claim_keypair_for_index`] below.
+    async fn ground_claim_keypair_static(
+        cfg: &UsdtClientConfig,
+        base: &Keypair,
+    ) -> anyhow::Result<(u64, Keypair, EvmAddress)> {
+        let base_pk = base.public_key();
+        let mut start = 0u64;
+        while start < MAX_SCAN_GRIND_ITERATIONS {
+            let end = start.saturating_add(Self::SCAN_GRIND_CHUNK);
+            if let Some((tweak, pk, account)) = find_scan_tweak(
+                &cfg.group_public_key,
+                cfg.account_factory,
+                cfg.simple_account_impl,
+                &base_pk,
+                start,
+                end,
+            )? {
+                let sk = if tweak == 0 {
+                    base.secret_key()
+                } else {
+                    base.secret_key()
+                        .add_tweak(&scan_tweak_scalar(tweak))
+                        .context("claim-key tweak")?
+                };
+                let keypair = Keypair::from_secret_key(SECP256K1, &sk);
+                debug_assert_eq!(keypair.public_key(), pk);
+                return Ok((tweak, keypair, account));
+            }
+            start = end;
+            // Yield between chunks (wasm responsiveness).
+            fedimint_core::runtime::sleep(Duration::from_millis(0)).await;
+        }
+        bail!("no scan tweak within MAX_SCAN_GRIND_ITERATIONS; statistically unreachable")
+    }
+
+    /// The DISCOVERABLE claim keypair for seed index `index`: the base
+    /// derived key ([`Self::claim_keypair_for_index`]) plus the grind
+    /// performed by [`Self::ground_claim_keypair_static`].
+    async fn ground_claim_keypair_for_index(
+        &self,
+        index: u64,
+    ) -> anyhow::Result<(u64, Keypair, EvmAddress)> {
+        let base = self.claim_keypair_for_index(index);
+        Self::ground_claim_keypair_static(&self.cfg, &base).await
+    }
+
     /// The deterministic withdrawal-refund keypair for seed-derivation `index`,
     /// derived purely from `module_root_secret` under [`REFUND_KEY_CHILD`]
     /// (security finding 09). Mirrors [`Self::claim_keypair_static`]: the same
@@ -534,8 +594,13 @@ impl UsdtClientModule {
                             .get_value(&NextDepositIndexKey)
                             .await
                             .unwrap_or_default();
-                        let claim_keypair = self.claim_keypair_for_index(index);
-                        let account = self.deposit_address(&claim_keypair.public_key());
+                        // Ground (discoverable) key: base index key + scan
+                        // tweak. `ClaimKeyKey` stores the FINAL tweaked
+                        // keypair, so the claim/sign path is unchanged.
+                        // Re-ground on an autocommit retry: rare, and the
+                        // grind is deterministic so retries are identical.
+                        let (_tweak, claim_keypair, account) =
+                            self.ground_claim_keypair_for_index(index).await?;
 
                         dbtx.insert_entry(&NextDepositIndexKey, &index.saturating_add(1))
                             .await;

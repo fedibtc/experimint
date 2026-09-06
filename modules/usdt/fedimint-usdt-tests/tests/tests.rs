@@ -155,6 +155,60 @@ async fn client_deposit_address_matches_common_derivation() -> anyhow::Result<()
     Ok(())
 }
 
+/// Deposit-discovery predicate (Task 8): the address `allocate_deposit`
+/// hands out must be DISCOVERABLE by the guardians' scan predicate
+/// (`is_potential_deposit`), not merely a valid CREATE2 derivation of some
+/// claim key. Before the client grinds a scan tweak on top of the
+/// seed-derived base key, an allocated address only satisfies the predicate
+/// by chance (~1/65536 at `DEPOSIT_SCAN_TAG_BITS`), so this is the RED half
+/// of Task 8's TDD story until `allocate_deposit` grinds.
+#[tokio::test(flavor = "multi_thread")]
+async fn allocated_deposit_addresses_satisfy_scan_predicate() -> anyhow::Result<()> {
+    let mock = Arc::new(MockEvmRpc::new());
+    mock.set_chain_id(31337);
+    mock.set_block_number(100);
+    let scripted_fee = FeeVote {
+        max_fee_per_gas_wei: 1_000_000_000,
+        usdt_per_eth_e6: 3_000_000_000,
+    };
+    mock.set_fee_estimate(scripted_fee);
+
+    let fed = dual_mint_fixtures(mock.clone())
+        .new_fed_builder(0)
+        .disable_mint_fees()
+        .build()
+        .await;
+    let client: ClientHandleArc = fed.new_client().await;
+    let usdt = client.get_first_module::<UsdtClientModule>()?;
+
+    // Part C gate: drive the module to Ready before allocating a deposit.
+    let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        usdt.config().entry_point,
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
+    );
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
+
+    let (claim_keypair, account) = usdt.allocate_deposit().await?;
+    let cfg = usdt.config();
+
+    // Discoverable...
+    assert!(
+        is_potential_deposit(&cfg.group_public_key, &account),
+        "allocate_deposit must hand out a scan-predicate-discoverable address"
+    );
+    // ...and still exactly the common derivation for the (tweaked) pk.
+    assert_eq!(
+        account,
+        fedimint_usdt_common::config::derive_deposit_account(cfg, &claim_keypair.public_key())
+    );
+
+    Ok(())
+}
+
 /// **Phase 5 gating acceptance test.** Drives the full deposit -> claim ->
 /// USDT-denominated e-cash flow over a hermetic in-process federation: a
 /// shared [`MockEvmRpc`] stands in for the EVM chain (every guardian reads
