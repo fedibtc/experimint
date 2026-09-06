@@ -904,6 +904,72 @@ pub fn create2_address(
     EvmAddress(derived.into_array())
 }
 
+/// Hard cap on scan-tweak grinding. At [`DEPOSIT_SCAN_TAG_BITS`] = 16 the
+/// probability of finding no tweak in 2^22 tries is e^{-64}: statistically
+/// unreachable, but the loop must still be bounded.
+pub const MAX_SCAN_GRIND_ITERATIONS: u64 = 1 << 22;
+
+/// The additive tweak `t` as a secp256k1 scalar (for
+/// `SecretKey::add_tweak` / `PublicKey::add_exp_tweak`).
+///
+/// # Panics
+///
+/// Never in practice: any `u64` is far below the curve order, so the
+/// underlying scalar construction cannot fail.
+#[must_use]
+pub fn scan_tweak_scalar(tweak: u64) -> secp256k1::Scalar {
+    let mut bytes = [0u8; 32];
+    bytes[24..].copy_from_slice(&tweak.to_be_bytes());
+    secp256k1::Scalar::from_be_bytes(bytes).expect("a u64 is far below the curve order")
+}
+
+/// Scans tweaks `start..end` for the first `t` such that
+/// `claim_pk = base_pk + t·G` derives a deposit account satisfying
+/// [`is_potential_deposit`]. Returns `(t, claim_pk, account)`, or `None` if
+/// no tweak in the range matches. Deterministic (recovery re-runs the same
+/// scan) and resumable (callers chunk the range to stay responsive on
+/// wasm). Hot loop cost per candidate: one point add + three short keccaks
+/// (salt, CREATE2, predicate) — the init-code hash is precomputed via
+/// [`deposit_init_code_hash`].
+///
+/// # Errors
+///
+/// Returns `Err` only if a tweak addition produces an out-of-range
+/// (effectively zero or curve-order) result -- astronomically unlikely for
+/// sequential small tweaks, but propagated rather than unwrapped.
+pub fn find_scan_tweak(
+    group_public_key: &secp256k1::PublicKey,
+    account_factory: EvmAddress,
+    simple_account_impl: EvmAddress,
+    base_pk: &secp256k1::PublicKey,
+    start: u64,
+    end: u64,
+) -> anyhow::Result<Option<(u64, secp256k1::PublicKey, EvmAddress)>> {
+    let end = end.min(MAX_SCAN_GRIND_ITERATIONS);
+    if start >= end {
+        return Ok(None);
+    }
+    let owner = evm_address(group_public_key);
+    let init_code_hash = deposit_init_code_hash(simple_account_impl, owner);
+    let mut pk = if start == 0 {
+        *base_pk
+    } else {
+        base_pk
+            .add_exp_tweak(secp256k1::SECP256K1, &scan_tweak_scalar(start))
+            .context("tweak offset")?
+    };
+    for tweak in start..end {
+        let account = create2_address(account_factory, deposit_salt(&pk), init_code_hash);
+        if is_potential_deposit(group_public_key, &account) {
+            return Ok(Some((tweak, pk, account)));
+        }
+        pk = pk
+            .add_exp_tweak(secp256k1::SECP256K1, &secp256k1::Scalar::ONE)
+            .context("tweak step")?;
+    }
+    Ok(None)
+}
+
 /// Identifies one instance of the guardians co-signing a single 32-byte
 /// digest (see [`signing_session_id`]). Plain data — wasm-safe, carries no
 /// cggmp21 state.
@@ -2306,6 +2372,64 @@ mod tests {
         };
         let fast = create2_address(factory, salt, deposit_init_code_hash(impl_, owner));
         assert_eq!(fast, expected);
+    }
+
+    #[test]
+    fn find_scan_tweak_finds_matching_key_and_secret_agrees() {
+        let secp = secp256k1::SECP256K1;
+        let ground_secret = secp256k1::SecretKey::from_slice(&[0x42; 32]).expect("valid");
+        let base_pk = ground_secret.public_key(secp);
+        let group_pk = test_group_pk();
+        let factory = EvmAddress([0x33; 20]);
+        let impl_ = EvmAddress([0x44; 20]);
+
+        let (tweak, pk, account) = find_scan_tweak(
+            &group_pk,
+            factory,
+            impl_,
+            &base_pk,
+            0,
+            MAX_SCAN_GRIND_ITERATIONS,
+        )
+        .expect("grind ok")
+        .expect("tweak exists within 2^22 (P(miss) ~ e^-64)");
+
+        // Predicate holds for the ground address...
+        assert!(is_potential_deposit(&group_pk, &account));
+        // ...the address is the real derivation for the ground pk...
+        assert_eq!(
+            account,
+            derive_deposit_account(&group_pk, factory, impl_, &pk)
+        );
+        // ...and the tweaked SECRET key matches the tweaked PUBLIC key.
+        let sk = if tweak == 0 {
+            ground_secret
+        } else {
+            ground_secret
+                .add_tweak(&scan_tweak_scalar(tweak))
+                .expect("tweak add")
+        };
+        assert_eq!(sk.public_key(secp), pk);
+    }
+
+    #[test]
+    fn find_scan_tweak_is_deterministic_and_resumable() {
+        let base_pk = secp256k1::SecretKey::from_slice(&[0x42; 32])
+            .expect("valid")
+            .public_key(secp256k1::SECP256K1);
+        let group_pk = test_group_pk();
+        let factory = EvmAddress([0x33; 20]);
+        let impl_ = EvmAddress([0x44; 20]);
+        let full = find_scan_tweak(&group_pk, factory, impl_, &base_pk, 0, 1 << 22).expect("ok");
+        // Chunked scan (256 at a time) lands on the identical tweak.
+        let mut chunked = None;
+        let mut start = 0;
+        while chunked.is_none() && start < (1 << 22) {
+            chunked = find_scan_tweak(&group_pk, factory, impl_, &base_pk, start, start + 256)
+                .expect("ok");
+            start += 256;
+        }
+        assert_eq!(full, chunked);
     }
 
     #[test]
