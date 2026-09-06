@@ -81,3 +81,47 @@ async fn alloy_evm_rpc_reads_chain_and_erc20_state() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Proves `AlloyEvmRpc::get_transfer_logs` reads real ERC-20 `Transfer` logs
+/// off a live node (the deposit-discovery scan's only multi-block
+/// `eth_getLogs`): a transfer to a fixed recipient must show up with the
+/// right recipient/amount, and scanning an unrelated (never-deployed) token
+/// address over the same range must come back empty.
+#[tokio::test]
+async fn alloy_evm_rpc_reads_transfer_logs() -> anyhow::Result<()> {
+    let Some(anvil) = common::spawn_anvil().await? else {
+        eprintln!(
+            "SKIP: anvil not available (set FM_ANVIL_BASE_EXECUTABLE to an anvil binary, or \
+             install foundry, and re-run)"
+        );
+        return Ok(());
+    };
+
+    let rpc = AlloyEvmRpc::new(anvil.url())?;
+
+    let holder = common::anvil_account_1_address()?;
+    let token = common::deploy_test_erc20(&anvil, holder, UsdtAmount(1_000_000)).await?;
+
+    let recipient = EvmAddress([0x44; 20]);
+    common::transfer_erc20_from_account_1(&anvil, token, recipient, UsdtAmount(250_000)).await?;
+
+    let head = rpc.get_block_number().await?;
+    let logs = rpc.get_transfer_logs(token, 0, head).await?;
+    assert!(
+        logs.iter()
+            .any(|log| log.to == recipient && log.value == 250_000),
+        "expected a Transfer log crediting {recipient:?} with 250_000, got {logs:?}"
+    );
+
+    // An unrelated (never-deployed) token address over the same range must
+    // come back empty -- `eth_getLogs` is filtered on the contract address,
+    // not just the event topic.
+    let unrelated_token = EvmAddress([0x55; 20]);
+    let unrelated_logs = rpc.get_transfer_logs(unrelated_token, 0, head).await?;
+    assert!(
+        unrelated_logs.is_empty(),
+        "unrelated token address must yield no Transfer logs, got {unrelated_logs:?}"
+    );
+
+    Ok(())
+}

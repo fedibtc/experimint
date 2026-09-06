@@ -8395,6 +8395,18 @@ mod tests {
             Ok(0)
         }
 
+        async fn get_transfer_logs(
+            &self,
+            _token: fedimint_usdt_common::EvmAddress,
+            _from_block: u64,
+            _to_block: u64,
+        ) -> anyhow::Result<Vec<crate::rpc::TransferLog>> {
+            // Consensus-logic tests in this crate never exercise the
+            // deposit-discovery scan (that lives in `fedimint-usdt-tests`'
+            // fuller `MockEvmRpc`); always no logs.
+            Ok(Vec::new())
+        }
+
         async fn get_fee_estimate(&self) -> anyhow::Result<fedimint_usdt_common::FeeVote> {
             Ok(fedimint_usdt_common::FeeVote {
                 max_fee_per_gas_wei: 0,

@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use fedimint_usdt_common::user_op::{SignedUserOp, UserOpReceipt};
 use fedimint_usdt_common::{EvmAddress, FeeVote, UsdtAmount};
-use fedimint_usdt_server::rpc::IServerEvmRpc;
+use fedimint_usdt_server::rpc::{IServerEvmRpc, TransferLog};
 
 /// In-memory state backing a [`MockEvmRpc`], guarded by a single [`Mutex`]
 /// since this is test-only scaffolding, not a hot path.
@@ -59,6 +59,11 @@ struct State {
     /// all-zero word. Overriding lets a test model a token whose balances
     /// mapping is NOT at `USDT_BALANCES_SLOT`.
     storage_overrides: HashMap<(EvmAddress, [u8; 32]), [u8; 32]>,
+    /// Scripted [`IServerEvmRpc::get_transfer_logs`] responses, keyed by
+    /// `token` (filtered by the requested block range at read time).
+    /// `HashMap`, not `BTreeMap`, since [`EvmAddress`] does not implement
+    /// `Ord` (matching this struct's other `EvmAddress`-keyed maps above).
+    transfer_logs: HashMap<EvmAddress, Vec<TransferLog>>,
 }
 
 /// Deterministic, block-number-derived stand-in for a canonical block hash
@@ -107,6 +112,7 @@ impl Default for State {
             block_hashes: HashMap::new(),
             entrypoint_deposits: HashMap::new(),
             storage_overrides: HashMap::new(),
+            transfer_logs: HashMap::new(),
         }
     }
 }
@@ -259,6 +265,13 @@ impl MockEvmRpc {
         self.lock().storage_overrides.insert((addr, key), word);
     }
 
+    /// Scripts the Transfer logs returned by
+    /// [`IServerEvmRpc::get_transfer_logs`] for `token` (filtered by the
+    /// requested block range at read time).
+    pub fn set_transfer_logs(&self, token: EvmAddress, logs: Vec<TransferLog>) {
+        self.lock().transfer_logs.insert(token, logs);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -304,6 +317,23 @@ impl IServerEvmRpc for MockEvmRpc {
     async fn get_erc20_basis_points_rate(&self, _token: EvmAddress) -> anyhow::Result<u64> {
         // Mock: a standard (fee-less) token.
         Ok(0)
+    }
+
+    async fn get_transfer_logs(
+        &self,
+        token: EvmAddress,
+        from_block: u64,
+        to_block: u64,
+    ) -> anyhow::Result<Vec<TransferLog>> {
+        Ok(self
+            .lock()
+            .transfer_logs
+            .get(&token)
+            .into_iter()
+            .flatten()
+            .filter(|l| (from_block..=to_block).contains(&l.block_number))
+            .cloned()
+            .collect())
     }
 
     async fn get_storage_at(

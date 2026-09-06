@@ -155,6 +155,12 @@ alloy::sol! {
         uint256 actualGasCost,
         uint256 actualGasUsed
     );
+
+    /// Canonical ERC-20 `Transfer` event — the authoritative record of a
+    /// token recipient on EVM (calldata scanning misses internal-call
+    /// transfers such as exchange withdrawals), used by the guardian-local
+    /// deposit-discovery scan.
+    event Transfer(address indexed from, address indexed to, uint256 value);
 }
 
 /// Converts the `-common` crate's [`PackedUserOperation`] into this module's
@@ -173,6 +179,17 @@ fn to_rpc_packed_user_op(p: &PackedUserOperation) -> PackedUserOperationRpc {
         paymasterAndData: p.paymasterAndData.clone(),
         signature: p.signature.clone(),
     }
+}
+
+/// A decoded ERC-20 `Transfer` observed by
+/// [`IServerEvmRpc::get_transfer_logs`]. Guardian-LOCAL observation data
+/// (never consensus state): it feeds the in-memory candidate log served by
+/// the `transfer_candidates` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferLog {
+    pub block_number: u64,
+    pub to: EvmAddress,
+    pub value: u128,
 }
 
 /// Server-side read (and broadcast) access to an EVM node, abstracted so
@@ -231,6 +248,18 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
     /// module's accounting does NOT compensate for (see the audit
     /// register's fee-insolvency risk).
     async fn get_erc20_basis_points_rate(&self, token: EvmAddress) -> anyhow::Result<u64>;
+
+    /// Every ERC-20 `Transfer` log of `token` in `from_block..=to_block`
+    /// (`eth_getLogs` filtered on the contract address + Transfer topic).
+    /// The ONLY multi-block `eth_getLogs` in the module: callers must keep
+    /// the range within free-tier limits (see `UsdtConfigLocal::
+    /// scan_batch_blocks`) and only request confirmed ranges.
+    async fn get_transfer_logs(
+        &self,
+        token: EvmAddress,
+        from_block: u64,
+        to_block: u64,
+    ) -> anyhow::Result<Vec<TransferLog>>;
 
     /// The current EVM fee market and USDT/ETH exchange rate, as seen by
     /// this guardian's node, forming this guardian's contribution to the
@@ -683,6 +712,25 @@ impl IServerEvmRpc for AlloyEvmRpc {
             .with_context(|| format!("basisPointsRate() on {token}"))?;
         u64::try_from(rate)
             .with_context(|| format!("basisPointsRate {rate} on {token} overflows u64"))
+    }
+
+    async fn get_transfer_logs(
+        &self,
+        token: EvmAddress,
+        from_block: u64,
+        to_block: u64,
+    ) -> anyhow::Result<Vec<TransferLog>> {
+        let filter = Filter::new()
+            .address(Address::from(token.0))
+            .from_block(from_block)
+            .to_block(to_block)
+            .event_signature(Transfer::SIGNATURE_HASH);
+        let logs = self
+            .provider
+            .get_logs(&filter)
+            .await
+            .with_context(|| format!("eth_getLogs Transfer scan {from_block}..={to_block}"))?;
+        Ok(transfer_logs_from_rpc(&logs))
     }
 
     async fn get_fee_estimate(&self) -> anyhow::Result<FeeVote> {
@@ -1189,6 +1237,23 @@ fn receipt_from_entrypoint_logs(
     None
 }
 
+/// Decodes raw `eth_getLogs` results into [`TransferLog`]s. Pure (no RPC),
+/// unit-tested; skips logs that fail to decode as `Transfer` or lack a
+/// block number (pending), and saturates `value` into `u128`.
+fn transfer_logs_from_rpc(logs: &[alloy::rpc::types::Log]) -> Vec<TransferLog> {
+    logs.iter()
+        .filter_map(|log| {
+            let block_number = log.block_number?;
+            let decoded = Transfer::decode_log(&log.inner).ok()?;
+            Some(TransferLog {
+                block_number,
+                to: EvmAddress(decoded.to.into_array()),
+                value: u128::try_from(decoded.value).unwrap_or(u128::MAX),
+            })
+        })
+        .collect()
+}
+
 /// Subset of an ERC-4337 `eth_getUserOperationReceipt` response the module
 /// needs as a HINT to locate the inclusion block (see
 /// [`AlloyEvmRpc::get_user_op_receipt`]); ALL authoritative receipt fields --
@@ -1405,6 +1470,41 @@ mod tests {
         assert!(!receipt.success);
         assert_eq!(receipt.block, 99);
         assert_eq!(receipt.block_hash, [0xBB; 32]);
+    }
+
+    /// Builds an `alloy` RPC [`alloy::rpc::types::Log`] carrying a real
+    /// ABI-encoded `Transfer` event, as `eth_getLogs` would return it.
+    /// `block_number: None` models a pending log (not yet mined).
+    fn make_transfer_log(
+        to: Address,
+        value: U256,
+        block_number: Option<u64>,
+    ) -> alloy::rpc::types::Log {
+        let event = Transfer {
+            from: Address::from([0x11; 20]),
+            to,
+            value,
+        };
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::from([0x22; 20]),
+                data: alloy::sol_types::SolEvent::encode_log_data(&event),
+            },
+            block_number,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn transfer_logs_from_rpc_decodes_to_and_value_and_skips_pending() {
+        let to = alloy_primitives::Address::from([0xAB; 20]);
+        let log = make_transfer_log(to, alloy_primitives::U256::from(1_500_000u64), Some(123));
+        let pending = make_transfer_log(to, alloy_primitives::U256::from(1u64), None); // no block_number yet
+        let decoded = transfer_logs_from_rpc(&[log, pending]);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].block_number, 123);
+        assert_eq!(decoded[0].to, EvmAddress([0xAB; 20]));
+        assert_eq!(decoded[0].value, 1_500_000);
     }
 
     /// A log for a different op hash, from a different address, or without a
