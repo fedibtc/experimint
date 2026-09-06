@@ -12,10 +12,11 @@
 //! The full intended experimint topology, **eight instances** across the
 //! seven kinds: `walletv2`, **two `mintv2` instances** (BTC unit 0 and USDT
 //! unit 1 — so both peg-in ecash and claimed USDT ecash work), `lnv2`,
-//! `usdt` (against a real local `anvil` with a freshly deployed test ERC-20
-//! + ERC-4337 EntryPoint), `amm`, `meta`, and `multi_sig_stability_pool`
-//! under its **test params** (mock BTC/USD oracle, 15s cycles — no outbound
-//! HTTP, fast feedback for multispend-style clients).
+//! `usdt` (against a real local `anvil` with a freshly deployed test
+//! ERC-20 + ERC-4337 EntryPoint), `amm`, `meta`, and
+//! `multi_sig_stability_pool` under its **test params** (mock BTC/USD
+//! oracle, 15s cycles — no outbound HTTP, fast feedback for
+//! multispend-style clients).
 //!
 //! devimint's own config-gen helper cannot express a second instance of one
 //! kind, so this binary spawns the guardians with `pre_dkg` and drives

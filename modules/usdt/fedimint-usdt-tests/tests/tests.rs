@@ -34,6 +34,61 @@ use fedimint_usdt_server::db::{
 use fedimint_usdt_server::rpc::TransferLog;
 use futures::StreamExt as _;
 
+/// Generous deadline for the end-to-end/backwards-compat discovery tests
+/// below: real (1s-interval) guardian-local scanner + consensus block-count
+/// polling, not manually pumped.
+const TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Consecutive equal [`UsdtClientModule::latest_anchored_block`] reads
+/// (spaced [`ANCHOR_STABLE_POLL_SECS`] apart) required before
+/// [`wait_for_anchor_to_stabilize`] considers the anchor settled. The
+/// consensus block-count vote's per-round catch-up under CPU contention can
+/// take much longer than its nominal ~1s cadence, so a single short gap
+/// between two reads is not enough to distinguish "stopped" from "still
+/// climbing, just slowly" -- requiring several spaced-out repeats makes a
+/// false "stable" read exponentially unlikely.
+const ANCHOR_STABLE_READS: u32 = 5;
+
+/// Spacing between the reads [`wait_for_anchor_to_stabilize`] compares.
+const ANCHOR_STABLE_POLL_SECS: u64 = 5;
+
+/// Waits for the federation's block-hash-ring anchor
+/// ([`UsdtClientModule::latest_anchored_block`]) to stop advancing: outside
+/// devimint/nextest, `Usdt::consensus_proposal`'s block-count vote can only
+/// climb a handful of blocks per consensus round (`is_running_in_test_env`
+/// gates the generous 100-block catch-up allowance), so right after a big
+/// mock block-number jump (e.g. to put a transfer past whatever the scanner
+/// has already covered), the anchor may still be climbing toward the mock's
+/// new head. `common::credit_deposit_via_proof` snapshots the anchor ONCE
+/// and re-anchors exactly that height by scripting the mock's hash for it;
+/// if the anchor is still moving when it snapshots, the block-hash observer
+/// moves on to newer heights before the synthetic-hash override lands (and,
+/// worse, a vote for that now-abandoned height can eventually be rejected
+/// outright as stale once the block count drifts `DEPOSIT_VOTE_MAX_AGE_BLOCKS`
+/// past it), so the proof can never verify -- every retry resubmits the same
+/// now-permanently-stale proof. Call this after any such jump and before
+/// claiming, to let the anchor settle first.
+async fn wait_for_anchor_to_stabilize(usdt: &UsdtClientModule) -> anyhow::Result<u64> {
+    fedimint_core::runtime::timeout(TIMEOUT, async {
+        let mut last = usdt.latest_anchored_block().await?.latest;
+        let mut stable_reads = 1u32;
+        loop {
+            sleep(Duration::from_secs(ANCHOR_STABLE_POLL_SECS)).await;
+            let now = usdt.latest_anchored_block().await?.latest;
+            if now > 0 && now == last {
+                stable_reads += 1;
+                if stable_reads >= ANCHOR_STABLE_READS {
+                    return Ok::<_, anyhow::Error>(now);
+                }
+            } else {
+                stable_reads = 1;
+            }
+            last = now;
+        }
+    })
+    .await?
+}
+
 fn fixtures() -> Fixtures {
     Fixtures::new_primary(MintClientInit, MintInit).with_module(UsdtClientInit, UsdtInit::default())
 }
@@ -450,6 +505,235 @@ async fn transfer_scan_surfaces_ground_candidates() -> anyhow::Result<()> {
         "the non-matching transfer must never surface as a match"
     );
     assert!(summary.cursor >= 150);
+    Ok(())
+}
+
+/// Full no-poll deposit flow (the whole feature's acceptance test): allocate
+/// (ground) -> on-chain transfer appears in the guardians' scan -> client
+/// DISCOVERS it via the candidate stream (no client-side EVM polling
+/// anywhere in the discovery step) -> claims via the unchanged proof path ->
+/// e-cash minted. Builds directly on
+/// `transfer_scan_surfaces_ground_candidates` (scan -> discovery) and
+/// `deposit_becomes_claimable_usdt_ecash` (proof -> mint), chaining the two.
+#[tokio::test(flavor = "multi_thread")]
+async fn deposit_is_discovered_via_scan_and_claimed() -> anyhow::Result<()> {
+    let mock = Arc::new(MockEvmRpc::new());
+    let usdt_contract = EvmAddress([0u8; 20]);
+    mock.set_chain_id(31337);
+    mock.set_block_number(64);
+    let scripted_fee = FeeVote {
+        max_fee_per_gas_wei: 1_000_000_000,
+        usdt_per_eth_e6: 3_000_000_000,
+    };
+    mock.set_fee_estimate(scripted_fee);
+    let deposit_fee = deposit_fee_quote(&scripted_fee).expect("scripted fee must produce a quote");
+
+    let fed = dual_mint_fixtures(mock.clone())
+        .new_fed_builder(0)
+        .disable_mint_fees()
+        .build()
+        .await;
+    let client: ClientHandleArc = fed.new_client().await;
+    let usdt = client.get_first_module::<UsdtClientModule>()?;
+
+    let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        usdt.config().entry_point,
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
+    );
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
+
+    // 1. Allocate a ground (discoverable) deposit address (Task 8's grinding).
+    //    Nothing below polls any EVM RPC client-side; discovery rides entirely
+    //    on the guardians' own scan + the `transfer_candidates` endpoint.
+    let (claim_keypair, account) = usdt.allocate_deposit().await?;
+
+    // 2. The deposit lands on-chain. `net_amount` is a multiple of 512 msat
+    //    (mintv2's smallest client denomination, mirroring
+    //    `deposit_becomes_claimable_usdt_ecash`) so step 5 can assert *exact*
+    //    minted-balance equality with no rounding dust. Bump the mock's block
+    //    height BEFORE placing the transfer at a fresh block (mirroring
+    //    `transfer_scan_surfaces_ground_candidates`), so the always-running
+    //    background scanner -- which has been ticking since federation boot --
+    //    can't race past it.
+    let net_amount = UsdtAmount(2_560_000);
+    let deposit = UsdtAmount(net_amount.0 + deposit_fee.0);
+    mock.set_block_number(200);
+    mock.set_transfer_logs(
+        usdt_contract,
+        vec![TransferLog {
+            block_number: 150,
+            to: account,
+            value: u128::from(deposit.0),
+        }],
+    );
+
+    // 3. Discovery: poll `discover_deposits` (the ONLY client-side action
+    //    driving this step) until the guardians' scan surfaces the match.
+    let discovered = fedimint_core::runtime::timeout(TIMEOUT, async {
+        loop {
+            let summary = usdt.discover_deposits().await.expect("discover ok");
+            if let Some(d) = summary.matches.iter().find(|d| d.account == account) {
+                return d.clone();
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await?;
+    assert_eq!(discovered.value, deposit);
+    assert_eq!(discovered.claim_pk, claim_keypair.public_key());
+    assert_eq!(discovered.block_number, 150);
+
+    // 3b. Let the block-hash-ring anchor finish climbing toward the mock's new
+    //     head before claiming (see `wait_for_anchor_to_stabilize`) -- the scan
+    //     reaching block 150 does not by itself mean the anchor has stopped
+    //     moving.
+    wait_for_anchor_to_stabilize(&usdt).await?;
+
+    // 4. Claim: the discovered candidate is a HINT only -- crediting authority
+    //    remains exclusively the unchanged, anchored-ring deposit-proof path
+    //    (hermetic synthetic-proof harness).
+    common::credit_deposit_via_proof(
+        &usdt,
+        &mock,
+        usdt_contract,
+        &claim_keypair,
+        account,
+        deposit,
+        TIMEOUT,
+    )
+    .await?;
+
+    // 5. e-cash minted: USDT-denominated balance equals the deposit net of the
+    //    deposit fee (mirrors `deposit_becomes_claimable_usdt_ecash`, step 3).
+    let poll_deadline = fedimint_core::runtime::Instant::now() + Duration::from_secs(30);
+    let balance = loop {
+        let balance = client.get_balance_for_unit(USDT_UNIT).await?;
+        if balance == Amount::from_msats(net_amount.0)
+            || fedimint_core::runtime::Instant::now() >= poll_deadline
+        {
+            break balance;
+        }
+        sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        balance,
+        Amount::from_msats(net_amount.0),
+        "scan-discovered, proof-claimed deposit mints the net amount as USDT e-cash"
+    );
+
+    Ok(())
+}
+
+/// Pre-discovery deposits are untouched: an UNTWEAKED claim key's address
+/// (predicate almost surely fails) never appears in the candidate stream, but
+/// its proof-path claim still credits exactly as before this feature existed.
+/// `allocate_deposit` (Task 8) always grinds a predicate-matching tweak, so no
+/// address it hands out can exercise this path -- this constructs the legacy
+/// shape (an un-ground claim key) directly, standing in for a pre-feature
+/// allocation.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_untweaked_deposit_still_claims_and_stays_out_of_stream() -> anyhow::Result<()> {
+    let mock = Arc::new(MockEvmRpc::new());
+    let usdt_contract = EvmAddress([0u8; 20]);
+    mock.set_chain_id(31337);
+    mock.set_block_number(64);
+    let scripted_fee = FeeVote {
+        max_fee_per_gas_wei: 1_000_000_000,
+        usdt_per_eth_e6: 3_000_000_000,
+    };
+    mock.set_fee_estimate(scripted_fee);
+
+    let fed = dual_mint_fixtures(mock.clone())
+        .new_fed_builder(0)
+        .disable_mint_fees()
+        .build()
+        .await;
+    let client: ClientHandleArc = fed.new_client().await;
+    let usdt = client.get_first_module::<UsdtClientModule>()?;
+
+    let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        usdt.config().entry_point,
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
+    );
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
+
+    // A fixed keypair standing in for a pre-feature (un-ground) allocation.
+    let legacy = secp256k1::Keypair::from_secret_key(
+        secp256k1::SECP256K1,
+        &secp256k1::SecretKey::from_slice(&[7u8; 32])?,
+    );
+    let account =
+        fedimint_usdt_common::config::derive_deposit_account(usdt.config(), &legacy.public_key());
+    assert!(
+        !is_potential_deposit(&usdt.config().group_public_key, &account),
+        "chosen fixed key must not accidentally satisfy the predicate (1/2^16); pick another \
+         fixed secret if it does"
+    );
+
+    // Bump the block height BEFORE placing the transfer at a fresh block
+    // (mirroring `transfer_scan_surfaces_ground_candidates`), so the
+    // always-running background scanner can't race past it.
+    mock.set_block_number(200);
+    mock.set_transfer_logs(
+        usdt_contract,
+        vec![TransferLog {
+            block_number: 150,
+            to: account,
+            value: 9_000_000,
+        }],
+    );
+
+    // The stream never lists it: poll a guardian's raw `transfer_candidates`
+    // response directly (bypassing client-side claim-key matching entirely,
+    // which would exclude it anyway since it was never `allocate_deposit`-
+    // persisted) until the scanner has passed block 150, asserting on every
+    // page that the legacy address never appears.
+    let peer = usdt
+        .all_peers()
+        .into_iter()
+        .next()
+        .expect("federation has at least one peer");
+    let api = client.api().with_module(usdt.id);
+    fedimint_core::runtime::timeout(TIMEOUT, async {
+        loop {
+            let resp = api.transfer_candidates(peer, 0).await?;
+            assert!(
+                resp.candidates.iter().all(|c| c.to != account),
+                "the un-ground legacy address must never appear in the candidate stream"
+            );
+            if resp.scanned_to >= 150 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await??;
+
+    // Let the block-hash-ring anchor finish climbing toward the mock's new
+    // head before claiming (see `wait_for_anchor_to_stabilize`).
+    wait_for_anchor_to_stabilize(&usdt).await?;
+
+    // ...but the proof path still credits it exactly as before this feature
+    // existed.
+    common::credit_deposit_via_proof(
+        &usdt,
+        &mock,
+        usdt_contract,
+        &legacy,
+        account,
+        UsdtAmount(9_000_000),
+        TIMEOUT,
+    )
+    .await?;
+
     Ok(())
 }
 

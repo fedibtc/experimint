@@ -610,6 +610,41 @@ fn parse_micro_usd(value: &str) -> Result<u128, String> {
         .ok_or_else(|| format!("{value:?} is too large"))
 }
 
+/// Retry a connectivity-dependent startup step with exponential backoff until
+/// it succeeds or a deadline passes. Exists because a freshly-started process
+/// races its own iroh DHT bootstrap: the first federation RPC can fail with a
+/// transient "Failed to connect to peer" that a retry a few seconds later
+/// resolves. Without this a single such failure aborted `main`, and systemd's
+/// restart turned it into a cold-start crash-loop.
+async fn with_startup_retry<T, F, Fut>(what: &str, mut op: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let mut delay = Duration::from_secs(2);
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) if std::time::Instant::now() < deadline => {
+                warn!(
+                    step = what,
+                    err = %err,
+                    retry_in_secs = delay.as_secs(),
+                    "startup step failed (federation likely not yet reachable); retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("{what} still failing after the startup retry deadline")
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,40 +726,5 @@ mod tests {
     fn the_size_cap_is_required() {
         Opts::try_parse_from(["amm-price-keeper", "--data-dir", "/tmp/keeper"])
             .expect_err("--max-trade-usd has no default");
-    }
-}
-
-/// Retry a connectivity-dependent startup step with exponential backoff until
-/// it succeeds or a deadline passes. Exists because a freshly-started process
-/// races its own iroh DHT bootstrap: the first federation RPC can fail with a
-/// transient "Failed to connect to peer" that a retry a few seconds later
-/// resolves. Without this a single such failure aborted `main`, and systemd's
-/// restart turned it into a cold-start crash-loop.
-async fn with_startup_retry<T, F, Fut>(what: &str, mut op: F) -> anyhow::Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
-{
-    let deadline = std::time::Instant::now() + Duration::from_secs(300);
-    let mut delay = Duration::from_secs(2);
-    loop {
-        match op().await {
-            Ok(value) => return Ok(value),
-            Err(err) if std::time::Instant::now() < deadline => {
-                warn!(
-                    step = what,
-                    err = %err,
-                    retry_in_secs = delay.as_secs(),
-                    "startup step failed (federation likely not yet reachable); retrying"
-                );
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(30));
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("{what} still failing after the startup retry deadline")
-                });
-            }
-        }
     }
 }
