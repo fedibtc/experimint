@@ -52,8 +52,8 @@ use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
     DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
     LATEST_ANCHORED_BLOCK_ENDPOINT, POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT,
-    USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
-    WITHDRAW_FEES_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    TRANSFER_CANDIDATES_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
+    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAW_FEES_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::user_op::{
     SignedUserOp, UnsignedUserOp, eth_signed_message_hash, user_op_hash,
@@ -63,9 +63,10 @@ use fedimint_usdt_common::{
     BootstrapState, DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositStatusRequest,
     DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES, MODULE_CONSENSUS_VERSION,
     MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse, RefundInfo, RefundStatusRequest,
-    RefundStatusResponse, SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
-    UsdtConsensusItem, UsdtGenParams, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput,
-    UsdtOutputError, UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
+    RefundStatusResponse, SigningSessionId, StatusResponse, TransferCandidatesRequest,
+    TransferCandidatesResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
+    UsdtGenParams, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
+    UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
     WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawFeesRequest, WithdrawalStatus,
     WithdrawalStatusRequest, WithdrawalStatusResponse, balances_storage_key, deposit_fee_quote,
     deposit_salt, derive_deposit_account, derive_pool_account, evm_address, fee_vote_in_sane_range,
@@ -831,7 +832,7 @@ impl ServerModuleInit for UsdtInit {
                 MODULE_CONSENSUS_VERSION.major,
                 MODULE_CONSENSUS_VERSION.minor,
             ),
-            &[(0, 0)],
+            &[(0, 1)],
         )
     }
 
@@ -1701,10 +1702,6 @@ pub struct Usdt {
     /// guardian-local `transfer_candidates` endpoint. NEVER consensus
     /// state: answers legitimately differ across guardians, and nothing in
     /// any `process_*` path reads it (sec-13 COMMIT-SAFETY).
-    ///
-    /// `#[allow(dead_code)]`: not yet read outside of construction -- the
-    /// `transfer_candidates` API endpoint that serves it is a later task.
-    #[allow(dead_code)]
     transfer_candidates: Arc<Mutex<scan::CandidateLog>>,
 }
 
@@ -2970,6 +2967,25 @@ impl ServerModule for Usdt {
                             amount: req.amount,
                         });
                     Ok(())
+                }
+            },
+            api_endpoint! {
+                TRANSFER_CANDIDATES_ENDPOINT,
+                ApiVersion::new(0, 1),
+                async |module: &Usdt, _context, req: TransferCandidatesRequest| -> TransferCandidatesResponse {
+                    // GUARDIAN-LOCAL, deliberately NOT consensus DB (unique
+                    // among this module's endpoints): candidates come from
+                    // this guardian's own in-memory Transfer-log scan, so
+                    // answers differ across peers and clients union
+                    // per-peer responses (never
+                    // `request_current_consensus`). Bounded read of a
+                    // size-capped buffer: no DB, no RPC, no amplification.
+                    let (candidates, scanned_to) = module
+                        .transfer_candidates
+                        .lock()
+                        .expect("not poisoned")
+                        .since(req.since_block, scan::MAX_TRANSFER_CANDIDATES_PER_RESPONSE);
+                    Ok(TransferCandidatesResponse { candidates, scanned_to })
                 }
             },
         ]
@@ -8064,7 +8080,7 @@ async fn handle_latest_anchored_block(dbtx: &mut DatabaseTransaction<'_>) -> Anc
 mod tests {
     use fedimint_core::bitcoin::Network;
     use fedimint_core::{Amount, BitcoinHash, PeerId, TransactionId};
-    use fedimint_usdt_common::EvmAddress;
+    use fedimint_usdt_common::{EvmAddress, TransferCandidate};
 
     use super::*;
     use crate::db::WithdrawFeesVoteKey;
@@ -8973,6 +8989,70 @@ mod tests {
         );
         module.block_count.store(cached_head, Ordering::Relaxed);
         module
+    }
+
+    /// Exercises the `TRANSFER_CANDIDATES_ENDPOINT` handler's read path
+    /// (`module.transfer_candidates.lock().since(..)`) directly against a
+    /// `Usdt::new_for_test` module, without going through the full
+    /// fixtures/api-dispatch stack: feeds the in-memory log via
+    /// `record_scan` (mirroring what `Usdt::spawn_transfer_scanner` would
+    /// do), then reads it back exactly as the endpoint handler does,
+    /// checking both the `since_block` cursor and the response-page cap.
+    #[tokio::test]
+    async fn transfer_candidates_endpoint_pages_and_caps() {
+        let module = test_module_with_block_count(4, 0).await;
+
+        {
+            let mut log = module.transfer_candidates.lock().expect("not poisoned");
+            let entries: Vec<TransferCandidate> = (0..3)
+                .map(|i| TransferCandidate {
+                    block_number: 10 + i,
+                    to: EvmAddress([u8::try_from(i).expect("small index"); 20]),
+                    value: UsdtAmount(1_000),
+                })
+                .collect();
+            log.record_scan(20, entries);
+        }
+
+        // `since_block = 0` returns every candidate, ascending, plus the
+        // scan's high-water mark -- exactly what the endpoint returns as
+        // `TransferCandidatesResponse { candidates, scanned_to }`.
+        let (candidates, scanned_to) = module
+            .transfer_candidates
+            .lock()
+            .expect("not poisoned")
+            .since(0, scan::MAX_TRANSFER_CANDIDATES_PER_RESPONSE);
+        assert_eq!(scanned_to, 20);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.block_number)
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+
+        // Cursor paging: `since_block = 11` excludes the first entry.
+        let (page, _) = module
+            .transfer_candidates
+            .lock()
+            .expect("not poisoned")
+            .since(11, scan::MAX_TRANSFER_CANDIDATES_PER_RESPONSE);
+        assert_eq!(
+            page.iter().map(|c| c.block_number).collect::<Vec<_>>(),
+            vec![12]
+        );
+
+        // Response-page cap: a `limit` of 1 (as if
+        // `MAX_TRANSFER_CANDIDATES_PER_RESPONSE` were 1) returns only the
+        // OLDEST entry above the cursor, not the newest.
+        let (capped, capped_scanned_to) = module
+            .transfer_candidates
+            .lock()
+            .expect("not poisoned")
+            .since(0, 1);
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].block_number, 10);
+        assert_eq!(capped_scanned_to, 20);
     }
 
     #[tokio::test]

@@ -1552,7 +1552,13 @@ impl ClientModuleInit for UsdtClientInit {
     type Module = UsdtClientModule;
 
     fn supported_api_versions(&self) -> MultiApiVersion {
-        MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 0 }])
+        // Bumped to (0, 1) alongside the server (deposit-discovery, Task
+        // 7): the `transfer_candidates` endpoint the client's
+        // deposit-discovery path (Task 9) depends on only exists at api
+        // (0, 1). Minor versions are additive on the server side, so this
+        // simply raises the minimum minor version this client code
+        // requires guardians to speak.
+        MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 1 }])
             .expect("no version conflicts")
     }
 
