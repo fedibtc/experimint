@@ -10,7 +10,7 @@ use alloy::eips::BlockId;
 use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
-use alloy::rpc::types::{Filter, TransactionRequest};
+use alloy::rpc::types::{Filter, TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolEvent as _;
@@ -38,6 +38,42 @@ fn bounded_reqwest_client() -> anyhow::Result<reqwest::Client> {
         .connect_timeout(Duration::from_secs(10))
         .build()
         .context("failed to build the bounded EVM RPC HTTP client")
+}
+
+/// Poll directly so cancellation cannot leave an Alloy heartbeat watcher alive.
+async fn wait_for_transaction_receipt(
+    provider: &DynProvider,
+    tx_hash: B256,
+) -> anyhow::Result<TransactionReceipt> {
+    poll_transaction_receipt(
+        provider,
+        tx_hash,
+        Duration::from_secs(crate::RPC_REQUEST_TIMEOUT_SECS),
+        Duration::from_secs(crate::poll_interval_secs()),
+    )
+    .await
+}
+
+async fn poll_transaction_receipt(
+    provider: &DynProvider,
+    tx_hash: B256,
+    deadline: Duration,
+    interval: Duration,
+) -> anyhow::Result<TransactionReceipt> {
+    crate::rpc_deadline_with(deadline, async {
+        loop {
+            if let Some(receipt) = provider
+                .get_transaction_receipt(tx_hash)
+                .await
+                .context("eth_getTransactionReceipt failed")?
+            {
+                return Ok(receipt);
+            }
+            fedimint_core::runtime::sleep(interval).await;
+        }
+    })
+    .await
+    .with_context(|| format!("waiting for transaction {tx_hash}"))
 }
 
 use crate::factory_bytecode::{
@@ -861,11 +897,11 @@ impl IServerEvmRpc for AlloyEvmRpc {
         let fund_tx = TransactionRequest::default()
             .with_to(Address::from(ARACHNID_DEPLOYER_SIGNER.0))
             .with_value(U256::from(ARACHNID_DEPLOY_TX_COST_WEI));
-        let fund_receipt = broadcaster
+        let pending = broadcaster
             .send_transaction(fund_tx)
             .await
-            .context("send Arachnid deployer-signer funding transaction")?
-            .get_receipt()
+            .context("send Arachnid deployer-signer funding transaction")?;
+        let fund_receipt = wait_for_transaction_receipt(broadcaster, *pending.tx_hash())
             .await
             .context("confirm Arachnid deployer-signer funding transaction")?;
         anyhow::ensure!(
@@ -880,11 +916,12 @@ impl IServerEvmRpc for AlloyEvmRpc {
         //    `receipt.status()`: this ancient legacy tx can surface a misleading
         //    receipt status on some nodes (observed on `anvil`) even though it deploys
         //    correctly, so success is verified by the deployer's code appearing below.
-        self.provider
+        let pending = self
+            .provider
             .send_raw_transaction(ARACHNID_RAW_DEPLOY_TX)
             .await
-            .context("broadcast Arachnid CREATE2-deployer deploy transaction")?
-            .get_receipt()
+            .context("broadcast Arachnid CREATE2-deployer deploy transaction")?;
+        wait_for_transaction_receipt(&self.provider, *pending.tx_hash())
             .await
             .context("confirm Arachnid CREATE2-deployer deploy transaction")?;
 
@@ -924,11 +961,11 @@ impl IServerEvmRpc for AlloyEvmRpc {
             .with_to(Address::from(ARACHNID_DEPLOYER.0))
             .with_input(calldata)
             .with_nonce(nonce);
-        let receipt = broadcaster
+        let pending = broadcaster
             .send_transaction(deploy_tx)
             .await
-            .context("send SimpleAccountFactory CREATE2 deploy transaction")?
-            .get_receipt()
+            .context("send SimpleAccountFactory CREATE2 deploy transaction")?;
+        let receipt = wait_for_transaction_receipt(broadcaster, *pending.tx_hash())
             .await
             .context("confirm SimpleAccountFactory CREATE2 deploy transaction")?;
         anyhow::ensure!(
@@ -1002,7 +1039,7 @@ impl IServerEvmRpc for AlloyEvmRpc {
                     let topup = need_with_margin - deposit;
                     // NONCE SEQUENCING: `depositTo` is a SECOND broadcaster tx.
                     // Set its nonce explicitly (NOT the provider's auto nonce
-                    // filler) and `get_receipt()` on it BEFORE the `handleOps`
+                    // filler) and wait for its receipt BEFORE the `handleOps`
                     // pending-nonce fetch below, so the two txs never share or
                     // gap a nonce (re-introducing the nonce-leak wedge). Each
                     // iteration awaits its receipt, so the next pending fetch --
@@ -1013,14 +1050,14 @@ impl IServerEvmRpc for AlloyEvmRpc {
                         .pending()
                         .await
                         .context("fetch broadcaster nonce for depositTo")?;
-                    let receipt = entry_point
+                    let pending = entry_point
                         .depositTo(sender)
                         .value(topup)
                         .nonce(nonce)
                         .send()
                         .await
-                        .context("send EntryPoint.depositTo transaction")?
-                        .get_receipt()
+                        .context("send EntryPoint.depositTo transaction")?;
+                    let receipt = wait_for_transaction_receipt(broadcaster, *pending.tx_hash())
                         .await
                         .context("confirm EntryPoint.depositTo transaction")?;
                     anyhow::ensure!(
@@ -1060,7 +1097,7 @@ impl IServerEvmRpc for AlloyEvmRpc {
         // failed send would leak a nonce, so the cached value drifts ahead of
         // the account's real on-chain nonce; a later `handleOps` transaction
         // then carries a future (gapped) nonce, sits un-mined in the mempool,
-        // and the `get_receipt()` below blocks forever -- permanently wedging
+        // and an unbounded receipt wait would block forever -- permanently wedging
         // every subsequent submission (e.g. a withdrawal batch submitted after
         // a sweep's `AA10` retries have leaked several nonces). Deriving the
         // nonce from chain state each call keeps a reverted send from
@@ -1071,13 +1108,13 @@ impl IServerEvmRpc for AlloyEvmRpc {
             .await
             .context("failed to fetch broadcaster nonce")?;
 
-        let receipt = entry_point
+        let pending = entry_point
             .handleOps(packed_ops, beneficiary)
             .nonce(nonce)
             .send()
             .await
-            .context("failed to send handleOps transaction")?
-            .get_receipt()
+            .context("failed to send handleOps transaction")?;
+        let receipt = wait_for_transaction_receipt(broadcaster, *pending.tx_hash())
             .await
             .context("failed to confirm handleOps transaction")?;
 
@@ -1275,6 +1312,145 @@ struct BundlerInnerReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real HTTP transport exercises the provider as well as our polling loop.
+    /// Closing each response keeps this mock independent of connection pooling.
+    async fn receipt_rpc(
+        mined: bool,
+    ) -> (
+        DynProvider,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let body = loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break serde_json::from_slice::<serde_json::Value>(
+                                &request[end + 4..end + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                assert_eq!(
+                    body["method"], "eth_getTransactionReceipt",
+                    "receipt waits must not start block polling"
+                );
+                observed.fetch_add(1, Ordering::SeqCst);
+                let result = if mined {
+                    serde_json::json!({
+                        "transactionHash": B256::ZERO,
+                        "transactionIndex": "0x0",
+                        "blockHash": B256::ZERO,
+                        "blockNumber": "0x1",
+                        "from": Address::ZERO,
+                        "to": Address::ZERO,
+                        "cumulativeGasUsed": "0x5208",
+                        "gasUsed": "0x5208",
+                        "effectiveGasPrice": "0x1",
+                        "contractAddress": null,
+                        "logs": [],
+                        "logsBloom": format!("0x{}", "00".repeat(256)),
+                        "status": "0x1",
+                        "type": "0x2"
+                    })
+                } else {
+                    serde_json::Value::Null
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0", "id": body["id"], "result": result
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response,
+                );
+                // Cancellation may close an in-flight connection.
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let provider = ProviderBuilder::new()
+            .connect_http(url.parse().unwrap())
+            .erased();
+        (provider, calls, task)
+    }
+
+    #[tokio::test]
+    async fn receipt_polling_stops_after_timeout_and_cancellation() {
+        use std::sync::atomic::Ordering;
+        for cancel in [false, true] {
+            let (provider, calls, server) = receipt_rpc(false).await;
+            let wait = poll_transaction_receipt(
+                &provider,
+                B256::ZERO,
+                Duration::from_millis(if cancel { 10_000 } else { 150 }),
+                Duration::from_millis(10),
+            );
+            if cancel {
+                assert!(
+                    fedimint_core::runtime::timeout(Duration::from_millis(150), wait,)
+                        .await
+                        .is_err()
+                );
+            } else {
+                let err = wait.await.unwrap_err();
+                assert!(format!("{err:#}").contains("timed out"));
+            }
+            // Let any request already accepted at cancellation finish.
+            fedimint_core::runtime::sleep(Duration::from_millis(50)).await;
+            let stopped = calls.load(Ordering::SeqCst);
+            assert!(stopped > 0);
+            fedimint_core::runtime::sleep(Duration::from_millis(150)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), stopped);
+            assert!(
+                !server.is_finished(),
+                "mock RPC rejected an unexpected request"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_polling_returns_mined_receipt_and_stops() {
+        use std::sync::atomic::Ordering;
+        let (provider, calls, server) = receipt_rpc(true).await;
+        poll_transaction_receipt(
+            &provider,
+            B256::ZERO,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        fedimint_core::runtime::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!server.is_finished());
+        server.abort();
+    }
 
     /// Constructing an [`AlloyEvmRpc`] must not require a live node: the
     /// underlying `alloy` HTTP provider is lazy, so an unreachable endpoint

@@ -4258,21 +4258,6 @@ impl Usdt {
                     .for_each_concurrent(
                         USER_OP_SUBMIT_CONCURRENCY,
                         move |(SubmittedUserOpKey(op_hash), record)| async move {
-                            // Idempotent, guardian-local: errors (including
-                            // "already included") are swallowed and simply
-                            // retried next tick.
-                            if let Err(err) =
-                                rpc_deadline(evm_rpc.submit_user_ops(vec![record.signed.clone()]))
-                                    .await
-                            {
-                                debug!(
-                                    target: "usdt",
-                                    err = %err.fmt_compact_anyhow(),
-                                    ?op_hash,
-                                    "UserOp submission failed, retrying next tick"
-                                );
-                            }
-
                             match rpc_deadline(evm_rpc.get_user_op_receipt(op_hash)).await {
                                 Ok(Some(receipt)) => {
                                     // Security finding 04: CONFIRMATION-DEPTH
@@ -4399,7 +4384,23 @@ impl Usdt {
                                             actual_gas_cost_wei: receipt.actual_gas_cost_wei,
                                         });
                                 }
-                                Ok(None) => {}
+                                Ok(None) => {
+                                    // Idempotent, guardian-local: errors (including
+                                    // "already included") are swallowed and simply
+                                    // retried next tick.
+                                    if let Err(err) = rpc_deadline(
+                                        evm_rpc.submit_user_ops(vec![record.signed.clone()]),
+                                    )
+                                    .await
+                                    {
+                                        debug!(
+                                            target: "usdt",
+                                            err = %err.fmt_compact_anyhow(),
+                                            ?op_hash,
+                                            "UserOp submission failed, retrying next tick"
+                                        );
+                                    }
+                                }
                                 Err(err) => {
                                     debug!(
                                         target: "usdt",
@@ -19629,7 +19630,7 @@ mod tests {
         let receipt_block = 10u64;
         let confirmation_depth = 6u64;
 
-        let evm_rpc = MockEvmRpc::default();
+        let evm_rpc = Arc::new(MockEvmRpc::default());
         evm_rpc.set_user_op_receipt(
             op_hash,
             fedimint_usdt_common::user_op::UserOpReceipt {
@@ -19676,7 +19677,7 @@ mod tests {
             &task_group,
             UserOpSubmitterHandles {
                 db: db.clone(),
-                evm_rpc: evm_rpc.into_dyn(),
+                evm_rpc: evm_rpc.clone(),
                 user_op_confirmed_proposals: proposals.clone(),
                 confirmation_depth,
                 num_peers,
@@ -19689,6 +19690,15 @@ mod tests {
         assert!(
             proposals.lock().expect("not poisoned").is_empty(),
             "a receipt shallower than confirmation_depth must not be proposed"
+        );
+
+        assert!(
+            evm_rpc
+                .submitted_user_ops
+                .lock()
+                .expect("not poisoned")
+                .is_empty(),
+            "an included UserOp must not be resubmitted while awaiting confirmation depth"
         );
 
         // Advance the consensus block count to exactly confirmation-deep.
@@ -19717,6 +19727,23 @@ mod tests {
             assert!(
                 fedimint_core::time::now() < deadline,
                 "receipt must be proposed once it becomes confirmation-deep"
+            );
+            fedimint_core::runtime::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(evm_rpc.submitted_user_ops().is_empty());
+
+        // A reorg removes inclusion: the next tick must resume submission.
+        evm_rpc
+            .user_op_receipts
+            .lock()
+            .expect("not poisoned")
+            .remove(&op_hash);
+        let deadline = fedimint_core::time::now() + Duration::from_secs(25);
+        while evm_rpc.submitted_user_ops().is_empty() {
+            assert!(
+                fedimint_core::time::now() < deadline,
+                "an absent receipt must allow submission again"
             );
             fedimint_core::runtime::sleep(Duration::from_millis(100)).await;
         }
