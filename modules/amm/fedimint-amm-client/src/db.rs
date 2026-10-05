@@ -264,9 +264,12 @@ mod tests {
         let mut dbtx = db.begin_transaction().await;
         let key = SwapOutcomeKey(OperationId::new_random());
 
-        dbtx.insert_entry(&key, &SwapOutcome::Settled {
-            amount_out: Amount::from_msats(500),
-        })
+        dbtx.insert_entry(
+            &key,
+            &SwapOutcome::Settled {
+                amount_out: Amount::from_msats(500),
+            },
+        )
         .await;
         assert_eq!(
             dbtx.get_value(&key).await,
@@ -277,9 +280,12 @@ mod tests {
 
         // A Tx2 retry re-reads the balance before claiming it, so the record
         // must take the freshest read rather than reject a second write.
-        dbtx.insert_entry(&key, &SwapOutcome::Settled {
-            amount_out: Amount::from_msats(700),
-        })
+        dbtx.insert_entry(
+            &key,
+            &SwapOutcome::Settled {
+                amount_out: Amount::from_msats(700),
+            },
+        )
         .await;
         assert_eq!(
             dbtx.get_value(&key).await,
