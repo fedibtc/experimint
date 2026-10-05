@@ -41,74 +41,37 @@ repository = "https://github.com/elsirion/experimint"
 version = "0.1.0"
 
 [workspace.dependencies]
-# --- fedimint (pinned to Fedi's line, NOT the experimint platform branch) ----
-#
-# All fedimint crates MUST share the exact same source pin, otherwise cargo
-# resolves them as distinct source packages and the trait impls stop lining up.
-# That applies across module families too: `amm` and `usdt` must see one and the
-# same `fedimint-core`, or they can never be registered into one federation.
-#
-# tag v0.11.2-fedi5-usdt.1: fedibtc/fedimint `v0.11.2-fedi5` plus the usdt
-# PLATFORM changes only -- per-unit client APIs, unit-stamped mintv2 ecash,
-# devimint's anvil support, and the two inert module hooks
-# (`provided_assets`, `get_documented_env_vars`). (`fedimint-threshold-ecdsa`
-# is no longer taken from the tag: it lives in this repo now, at
-# `crypto/threshold-ecdsa`, next to its only consumer.) It carries NO copy of
-# the usdt module itself: the v0.11.0-fedi9-usdt line vendored one, and its
-# staleness once shipped a silent wire-format break (`UsdtInput::V0` deleted
-# upstream renumbered `DepositProofV0` under positional enum encoding; fixed
-# by the consensus-0.13 bump). The module now has exactly one home -- this
-# repo -- and this workspace builds `fedimint-usdt-server` against the Fedi
-# platform so any such drift is a compile error here, not a runtime hang.
-#
-# Fedi's `release/edge` points every fedimint row of its own workspace at this
-# same tag, which is what makes it the meeting point: a Fedi app consuming these
-# crates resolves one `fedimint-core`, not two. That is also why this pin must
-# move in lockstep with Fedi's rows: a mismatch here duplicates the entire
-# fedimint core stack rather than erroring cleanly.
-#
-# The two lines are SIBLINGS, not one ahead of the other. They diverged at
-# upstream 14f6399cde4 (2026-03-31); `master`'s `experimint-v0.11` pin carries
-# ~4 months of upstream commits this tag does not have, and this tag carries
-# Fedi's own. (`be854220f`, named here previously, is the merge-base with
-# upstream master and is NOT contained in the fedi line — the old comment was wrong.)
-#
-# A tag, not a `rev`, because the pin's whole purpose is to name the same
-# immutable object Fedi names. Tags in git dependencies are resolved to a
-# commit in `Cargo.lock`, so this stays reproducible.
-#
-# To bump: move this tag in lockstep with Fedi's fedimint rows, then re-run the
-# wasm gate in `docs/fedi9-compat.md`.
-devimint = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-aead = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-api-client = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-bip39 = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-build = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-client = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-client-module = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-connectors = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-core = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-derive-secret = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-dummy-client = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-dummy-server = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-eventlog = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-lnv2-server = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-logging = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-meta-server = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-mint-client = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-mint-common = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-mint-server = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-mintv2-client = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-mintv2-common = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-mintv2-server = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-server = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-server-core = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-testing = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimint-walletv2-server = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
-fedimintd = { git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
+# Use the same Fedimint revision as the consuming Fedi workspace.
+devimint = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-aead = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-api-client = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-bip39 = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-build = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-client = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-client-module = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-connectors = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-core = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-derive-secret = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-dummy-client = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-dummy-server = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-eventlog = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-lnv2-server = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-logging = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-meta-server = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-mint-client = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-mint-common = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-mint-server = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-mintv2-client = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-mintv2-common = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-mintv2-server = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-server = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-server-core = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-testing = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimint-walletv2-server = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
+fedimintd = { git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
 # `hkdf` is what `crypto/threshold-ecdsa` calls the crate; the package is
 # fedimint's own `fedimint-hkdf`, so it lives in this pinned block.
-hkdf = { package = "fedimint-hkdf", git = "https://github.com/fedibtc/fedimint", tag = "v0.11.2-fedi5-usdt.1" }
+hkdf = { package = "fedimint-hkdf", git = "https://github.com/fedibtc/fedimint", rev = "c25967aa1cd4425136c16397317aea6ead9fb0c7" }
 
 # NOTE: fedimint's own `Cargo.lock` is NOT inherited when you depend on it as a
 # git dependency — cargo re-resolves the whole tree from scratch. That can land
